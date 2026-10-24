@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">AoE Chief</title>
+  <desc id="desc">A standby chief of staff for your parallel AI coding agents</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#161b22"/>
+      <stop offset="1" stop-color="#0b0f14"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#f4a024"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#f4a024" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#f4a024" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="900" height="260" rx="22" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="899" height="259" rx="21.5" fill="none" stroke="#30363d"/>
+
+  <!-- emblem: a crown over a terminal prompt -->
+  <circle cx="130" cy="130" r="110" fill="url(#glow)"/>
+  <circle cx="130" cy="130" r="82" fill="#0d1117" stroke="url(#gold)" stroke-width="4"/>
+  <path d="M86 140 L78 88 L106 110 L130 74 L154 110 L182 88 L174 140 Z" fill="url(#gold)"/>
+  <rect x="86" y="146" width="88" height="11" rx="4" fill="url(#gold)"/>
+  <circle cx="78" cy="88" r="6" fill="#ffd166"/>
+  <circle cx="130" cy="74" r="6" fill="#ffd166"/>
+  <circle cx="182" cy="88" r="6" fill="#ffd166"/>
+  <text x="130" y="190" text-anchor="middle" fill="#7ee787"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22" font-weight="700">&gt;_</text>
+
+  <!-- wordmark -->
+  <text x="262" y="66" fill="#7ee787" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16">$ chief watch --every 300</text>
+  <text x="258" y="126" fill="#f0f6fc" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="64" font-weight="800" letter-spacing="-1">AoE <tspan fill="url(#gold)">Chief</tspan></text>
+  <text x="262" y="160" fill="#9aa4b2" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="19">
+    A standby chief of staff for your parallel AI coding agents
+  </text>
+
+  <!-- the four signals of a brief -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" fill="#c9d1d9">
+    <rect x="258" y="186" width="128" height="32" rx="16" fill="#21262d"/>
+    <circle cx="278" cy="202" r="6" fill="#f85149"/><text x="292" y="207">needs you</text>
+    <rect x="396" y="186" width="138" height="32" rx="16" fill="#21262d"/>
+    <circle cx="416" cy="202" r="6" fill="#d29922"/><text x="430" y="207">to confirm</text>
+    <rect x="544" y="186" width="128" height="32" rx="16" fill="#21262d"/>
+    <circle cx="564" cy="202" r="6" fill="#3fb950"/><text x="578" y="207">to accept</text>
+    <rect x="682" y="186" width="112" height="32" rx="16" fill="#21262d"/>
+    <circle cx="702" cy="202" r="6" fill="#58a6ff"/><text x="716" y="207">changed</text>
+  </g>
+</svg>

@@ -1,96 +1,150 @@
-# AoE Chief
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="AoE Chief: a standby chief of staff for your parallel AI coding agents" width="820">
+</p>
 
-A standby "chief of staff" for parallel AI coding agents running in **Agent of Empires (AoE)**.
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Python 3.7+" src="https://img.shields.io/badge/python-3.7%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Dependencies: none" src="https://img.shields.io/badge/dependencies-none-brightgreen">
+  <a href="https://github.com/agent-of-empires/agent-of-empires"><img alt="Built on Agent of Empires" src="https://img.shields.io/badge/built%20on-Agent%20of%20Empires-8957e5"></a>
+  <a href="https://github.com/openai/codex"><img alt="Works with Codex CLI" src="https://img.shields.io/badge/works%20with-Codex%20CLI-black"></a>
+  <a href="https://github.com/anthropics/claude-code"><img alt="Works with Claude Code" src="https://img.shields.io/badge/works%20with-Claude%20Code-d97757"></a>
+</p>
 
-You run several Codex / Claude Code sessions at once, but you cannot keep switching context between them. AoE Chief
-watches the sessions for you. It drives delegated tasks forward on its own and only interrupts you when a human
-decision is actually needed. Its reports are thin first, thick on demand.
+<p align="center">
+  <a href="#-quick-start">Quick start</a> ·
+  <a href="#-how-it-works">How it works</a> ·
+  <a href="#-commands">Commands</a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="rules/communication.md">Agent rules</a>
+</p>
 
-## Why
+---
 
-It addresses two problems:
+> **You define the task. You accept the result. Chief handles everything in between.**
 
-1. **Too many parallel agents, one human brain.** Checking every session to see who is stuck, who is done and who is
-   waiting for an answer does not scale. A supervisor should do that and report back.
-2. **Replies that are complete but not useful.** Agents tend to dump everything. A shared communication protocol
-   makes them lead with the conclusion and end every turn with a machine-readable closing block, so that both you
-   and Chief can triage quickly.
+You run five AI coding agents at once. One is stuck, one is waiting for an answer, one says it is "done" but its
+tests fail, and two are fine. You cannot tell which is which without checking every session.
 
-## How it works
+**AoE Chief** keeps watch over your [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires)
+sessions:
 
+- It drives delegated tasks to completion: it runs the checks, nudges the agent forward, and reviews the result
+  with a second model.
+- It only interrupts you when a human decision is really needed.
+- Its reports are **thin first, thick on demand**: one line per thing that matters, details when you ask.
+
+An illustrative brief:
+
+```text
+$ chief brief
+# AoE brief  10-25 01:24
+
+**L0:** tracking 3 · needs you 1 · to confirm 1 · to accept 1 · changed 0 · unchanged 0
+
+## 🔴 Needs you
+- **csv import** `5d1c09a2` codex · idle · 4m ago
+  - decide csv-import:2: Should I delete the legacy importer? Options: A) delete B) keep. Recommendation: B
+  - Handle: `chief.py decide csv-import:2 --reply "your decision"`
+
+## 📝 To confirm (drafted by chief)
+- **shop demo** `84392916` codex · idle · 0m ago
+  - chief drafted decision shop-demo:1: A) Plain text lines, the function is documented as human-readable
+  - Handle: `chief.py decide shop-demo:1 --accept` (or `--reply "..."`)
+
+## ✅ To accept
+- **parser fix** `a8e3f0c1` codex · idle · 2m ago
+  - all checks pass (2/2), ready for you to accept
+  - 🤖 chief: checks 1/2: sent the failures back and asked it to continue (#1)
+  - Review (claude/sonnet): pass — Trailing commas are accepted in all three grammar rules; tests untouched.
+  - Accept `chief.py close parser-fix` · send back `chief.py nudge parser-fix --review`
 ```
-   you: define the task                         you: accept or send back
-            │                                              ▲
-            ▼                                              │
-   ┌──────────────────────────── task board ───────────────┴──────┐
-   │ tasks/<id>/task.json · decisions.json · events.jsonl · review.md │
-   └───────┬──────────────────────────────────────────▲───────────┘
-           │ chief new: worktree + session + kickoff   │ every tick
-           ▼                                           │
-   ┌──────────────────┐   end of turn    ┌─────────────┴────────────┐
-   │ worker (Codex /  │ ───────────────► │ chief: run checks, triage │
-   │ Claude) in its   │ ◄─────────────── │ continue / recover /      │
-   │ own git worktree │   next message   │ rotate / review           │
-   └──────────────────┘                  └──────────────────────────┘
-```
 
-- **Read-only by default.** Chief reads AoE state, the agents' native transcripts (`~/.claude/projects`,
-  `~/.codex/sessions`), the live tmux screen and git. It only acts on tasks you created with `chief new`.
-- **Deterministic rules before AI.** Rules decide what needs you. AI is used only to write briefs, to optionally
-  draft decisions, and to review finished work.
-- **Done means checks pass.** Each task has executable checks. A task is done when the checks pass, not when the
-  agent says so. Protected paths, such as tests, are monitored, so the agent cannot game the checks.
+## 🤔 Why
 
-Signal levels in the brief:
-
-| Level | Meaning |
+| The problem | What Chief does about it |
 |---|---|
-| 🔴 needs you | Big decision, blocker, budget exceeded, protected file touched, stuck, or review failed |
-| 📝 to confirm | Chief drafted a small decision; one command approves it |
-| ✅ to accept | All checks pass and a cross-model review card is ready |
-| 🟡 changed | Progress since the last brief |
-| ⚪ unchanged | Nothing new |
+| 🧠 **One human, many agents.** Context switching between parallel sessions does not scale. | Watches every session and tells you only what changed and what needs you. |
+| 🗣️ **Replies that are complete but not useful.** Agents dump everything and bury the conclusion. | A shared [communication protocol](rules/communication.md) makes agents lead with the conclusion and end each turn with a machine-readable closing block. |
+| 🏁 **"Done" that is not done.** An idle process or a confident agent proves nothing. | A task is done when its **executable checks** pass and **another model** has reviewed the diff. |
+| 🔁 **You are the "continue" button.** Every small nudge and decision waits for you. | Chief continues automatically on failing checks, drafts small decisions for one-command approval, and escalates only big ones. |
 
-## Requirements
+## ✨ Features
 
-- Linux or macOS, Python 3.7+ (standard library only), git 2.20+
-- Agent of Empires CLI (`aoe`, tested with 1.21) with a profile (default `main`)
-- At least one agent CLI: `codex` and/or `claude`. Using both lets them review each other's work.
+- **🗂️ Task contracts:** `chief new` creates a goal, checks, scope, protected paths and a budget, plus a git
+  worktree and a fresh agent session.
+- **✅ Objective done:** check commands decide when a task is done. Changes to protected paths, such as tests, are
+  flagged, so an agent cannot pass by editing the tests.
+- **📝 Decision queue:** small questions are drafted by Chief and approved with `--accept`. Big ones (push, delete,
+  goal changes and the like) are always yours.
+- **🔁 Auto-continue:** when checks fail, Chief sends the failing output back to the agent. It recovers
+  interrupted turns and detects stuck loops.
+- **♻️ Fresh context:** when a session's context fills up, a new session picks up from `.chief/progress.md`.
+- **🔍 Cross-model review:** Codex's work is reviewed by Claude and vice versa, and every review produces a review
+  card.
+- **🧾 Learns your taste:** every override is written to `preferences.md`, and acceptance rates show what could
+  be automated next.
+- **🌐 English or Chinese output:** switch with `chief lang en|zh`.
 
-## Install
+## 🧭 How it works
+
+```mermaid
+flowchart LR
+    you(["🧑 You"]) -- "chief new" --> board[("Task board<br/>contract · checks · decisions")]
+    board -- "worktree + kickoff" --> worker["🤖 Worker<br/>Codex / Claude Code"]
+    worker -- "end of turn" --> chief{{"🎩 chief tick"}}
+    chief -- "checks fail: continue" --> worker
+    chief -- "all checks pass" --> reviewer["🔍 Other model"]
+    reviewer --> card[/"Review card"/]
+    chief -- "🔴 big decision or stuck" --> you
+    card -- "✅ accept or send back" --> you
+```
+
+Design principles:
+
+1. **Read-only by default.** Chief reads AoE state, the agents' native transcripts, the tmux screen and git. It
+   acts only on tasks you created with `chief new`.
+2. **Rules before AI.** Deterministic rules decide what needs you. AI writes briefs, optionally drafts decisions,
+   and reviews finished work.
+3. **Untrusted by default.** Transcripts, screens and diffs are data, never instructions, in every AI prompt.
+4. **Humans own the irreversible.** Chief never pushes, merges or deploys.
+
+## 🚀 Quick start
+
+**Requirements:**
+- Linux or macOS, Python 3.7+ (standard library only), git
+- [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires) (`aoe`, tested with 1.21)
+- [Codex CLI](https://github.com/openai/codex) and/or [Claude Code](https://github.com/anthropics/claude-code).
+  Install both to get cross-model review.
 
 ```bash
-git clone <this repo> ~/aoe-chief
+git clone https://github.com/lialittis/AoE-Chief.git ~/aoe-chief
 alias chief="python3 ~/aoe-chief/chief.py"
 chief init
 
-# Communication rules for the agents (closing block, thin-first replies). Merge them into your existing files if you
-# have any.
-cp rules/communication.md ~/.claude/CLAUDE.md
-cp rules/communication.md ~/.codex/AGENTS.md
+# Teach your agents the closing-block protocol. Merge it into existing files if you have them.
+cp ~/aoe-chief/rules/communication.md ~/.claude/CLAUDE.md
+cp ~/aoe-chief/rules/communication.md ~/.codex/AGENTS.md
 ```
 
-If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set
-`AOE_BIN`.
+### 🎮 Try the demo (about 5 minutes)
 
-## Quick start: the demo
-
-`demo.sh` creates a small repository with three bugs and delegates it to Codex. The worker is told to fix one test
-per turn and to ask a question before one of the fixes. That exercises auto-continue, the decision queue and the
-cross review. Its state lives in a separate directory, so your real board is untouched.
+`demo.sh` creates a small shop library with three bugs and delegates it to Codex. The worker is told to fix one
+test per turn and to ask before choosing the receipt format. So you get to see auto-continue, a drafted decision
+and a cross review. The demo state lives in its own directory, so your real board stays clean.
 
 ```bash
-./demo.sh                                   # create ~/workspace/chief-demo and start the task
+~/aoe-chief/demo.sh
 export AOE_CHIEF_HOME=~/.local/state/aoe-chief-demo
-chief watch --every 30                      # in another terminal: let Chief drive
-chief brief                                 # see what needs you
-chief decisions                             # answer with: chief decide <id> --accept | --reply "..."
+chief watch --every 30          # terminal 2: let Chief drive
+chief brief                     # what needs you?
+chief decide shop-demo:1 --accept
 cat $AOE_CHIEF_HOME/tasks/shop-demo/review.md
-chief close shop-demo                       # accept, or: chief nudge shop-demo "please also ..."
-./demo.sh clean                             # remove the demo sessions, worktree, branch and state
+chief close shop-demo           # or: chief nudge shop-demo "also format prices with 2 decimals"
+~/aoe-chief/demo.sh clean
 ```
 
-## Daily use
+## 📅 Daily use
 
 **Delegated tasks** have a clear goal and objective checks. Create each one as a task:
 
@@ -98,83 +152,82 @@ chief close shop-demo                       # accept, or: chief nudge shop-demo 
 chief new --repo ~/workspace/myproj --name "parser fix" \
   --goal "Make the parser accept trailing commas" \
   --check "pytest tests/parser -q" --scope src/parser --protected tests \
-  --rounds 10 --hours 3          # add --dry-run to preview the contract and kickoff prompt
+  --rounds 10 --hours 3          # add --dry-run to preview the contract and the kickoff prompt
 chief watch --every 300          # keep this running in a tmux window
-chief brief                      # check in when convenient
+chief brief                      # check in whenever you like
 ```
 
 **Thinking tasks** are open-ended conversations. You talk to the agent directly. Chief can still watch those
 sessions and summarize them (`chief track <session>`), but it does not drive them.
 
-Answer the agents' questions **through Chief** (`chief decide`), not inside the session. Every accept, override
-and dismissal is recorded, and that record is the data used to decide which kinds of decisions Chief may make on
-its own later (`chief decisions --stats`).
+> 💡 **Answer agents through Chief** (`chief decide`), not inside the session. Every accept, override and
+> dismissal is recorded. That record decides which kinds of decisions Chief may later make on its own
+> (`chief decisions --stats`).
 
-## Commands
+## 🧰 Commands
 
 | Area | Command | What it does |
 |---|---|---|
-| Observe | `sessions [--all]`, `track`, `untrack` | Pick AoE sessions to watch |
-| | `brief [--ai] [--level 1-3]` | Triage report; `--ai` has an AI write it from the facts |
-| | `show <id> [--turns N]` | Drill into one session or task: progress file, checks, decisions, recent turns |
-| | `task <id> --goal --check --scope --protected` | Attach a goal and checks to a session you did not create with `new` |
+| 👀 Observe | `sessions`, `track`, `untrack` | Pick AoE sessions to watch |
+| | `brief [--ai] [--level 1-3]` | Triage report; with `--ai`, a model writes it from the facts |
+| | `show <id> [--turns N]` | Drill into one task: progress file, checks, decisions, recent turns |
+| | `task <id> --goal --check ...` | Attach a goal and checks to a session you did not create with `new` |
 | | `check <id>` | Run a task's checks now |
-| Tasks | `new ...`, `tasks`, `kickoff <id>`, `close <id> [--abandon] [--remove-session]` | Task lifecycle |
-| Drive | `tick [--dry-run]`, `watch --every SEC` | One round, or a loop, of automatic actions |
+| 🗂️ Tasks | `new`, `tasks`, `kickoff`, `close [--abandon] [--remove-session]` | Task lifecycle |
+| 🔁 Drive | `tick [--dry-run]`, `watch --every SEC` | One round, or a loop, of automatic actions |
 | | `nudge <id> [TEXT] [--review]` | Send guidance or review issues back, and resume automation |
-| | `rotate <id>`, `review <id>` | Start a fresh session from the progress file; run a cross review now |
-| Decide | `decisions [--all] [--stats]` | The decision queue |
-| | `decide <id> --accept / --reply TEXT / --dismiss [REASON] / --redraft / --ai` | Resolve one decision |
-| AI | `engine [codex\|claude]` | Default engine for briefs and drafts, and the model used at each level |
-| Settings | `lang [en\|zh]` | Output language |
+| | `rotate <id>`, `review <id>` | Start a fresh session now; run a cross review now |
+| 📝 Decide | `decisions [--all] [--stats]` | The decision queue and acceptance stats |
+| | `decide <id> --accept \| --reply TEXT \| --dismiss [REASON]` | Resolve a decision (`--redraft` / `--ai` re-judge it) |
+| ⚙️ Settings | `engine [codex\|claude]`, `lang [en\|zh]` | AI engine and models per level; output language |
 
-## What `tick` does
+<details>
+<summary><b>What <code>tick</code> does, situation by situation</b></summary>
 
 For each active task, `tick` does at most one thing. It does nothing for tasks with `autonomy: observe`.
 
 | Situation | Action |
 |---|---|
 | Any red signal, or a pending decision | Nothing; the task waits for you |
-| The turn was interrupted or errored | Recover once; if it fails again, the task goes to you |
+| The turn was interrupted or errored | Recover once; if it fails again, hand it to you |
 | Checks fail and the turn ended | Send the failing output back and ask the worker to continue |
 | The same failure `stuck_after` (3) times in a row | Mark the task stuck and hand it to you |
 | `max_auto_continues` (8) continues without your input | Pause and hand it to you |
-| Context use ≥ `rotate_at` (70%) | Start a fresh session in the same worktree; it resumes from `.chief/progress.md` |
+| Context use ≥ `rotate_at` (70%) | Start a fresh session in the same worktree that resumes from `.chief/progress.md` |
 | All checks pass and HEAD has not been reviewed | The other model reviews the diff against the contract and writes `review.md` |
 
-## Configuration
+</details>
+
+<details>
+<summary><b>Configuration</b></summary>
 
 Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief/`).
 
 | Key | Default | Meaning |
 |---|---|---|
 | `profile` | `main` | AoE profile |
-| `lang` | `en` | Output language: `en` or `zh`; the `AOE_CHIEF_LANG` environment variable overrides it. Messages to workers are always English |
+| `lang` | `en` | Output language, `en` or `zh`. The `AOE_CHIEF_LANG` environment variable overrides it. Messages to workers are always in English |
 | `engine` | `codex` | AI engine for briefs and decision drafts |
-| `models` | see `chief engine` | Per-engine, per-level model and effort overrides |
-| `check_timeout` | 300 | Seconds per check command |
-| `scope_ignore` | `[]` | Extra patterns ignored by the scope check |
+| `models` | see `chief engine` | Model and effort overrides, per engine and level |
+| `check_timeout` | 300 | Seconds allowed per check command |
+| `scope_ignore` | `[]` | Extra patterns the scope check ignores |
 | `decision_ai` | `false` | Let AI re-judge and draft new decisions |
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
 | `review`, `review_engine`, `review_level` | `true`, the other engine, 2 | Cross review |
 
-## Safety model
+If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set
+`AOE_BIN`.
 
-- Chief never pushes, merges or deploys, and tells workers not to do so either. Accepting work is always your
-  decision.
-- Check commands run as you, so only register commands you trust.
-- Transcript, screen and diff content is treated as untrusted data in every AI prompt.
-- Codex's "trust this folder" prompt is answered only when you pass `--trust`.
-- Big decisions cannot be auto-accepted. Rules flag them: pushes, deletions, test changes, goal or budget changes,
-  protected paths, or other red signals. An AI may upgrade a decision from small to big, but never downgrade one.
+</details>
 
-## State layout
+<details>
+<summary><b>State layout</b></summary>
 
-```
+```text
 $AOE_CHIEF_HOME/
-  config.json            settings and sessions you track
+  config.json            settings and the sessions you track
   latest.md, reports/    the latest brief and the brief archive
-  checks.json            check result cache, keyed by session
+  checks.json            check result cache
   preferences.md         your overrides of Chief's drafts; AI drafting reads this
   tasks/<id>/
     task.json            the contract and state
@@ -184,14 +237,37 @@ $AOE_CHIEF_HOME/
 <worktree>/.chief/progress.md   the worker's handoff file (git-ignored locally)
 ```
 
-## Status
+</details>
 
-The core loop is implemented and tested end to end with real Codex and Claude sessions: task contracts, executable
-checks, the decision queue, auto-continue, stuck detection, session rotation and cross review. Next is phase D:
-push notifications for 🔴 items and per-category automatic decisions, unlocked by your acceptance rate. See
-[docs/architecture.md](docs/architecture.md).
+## 🛡️ Safety model
 
+- 🚫 **No push, merge or deploy:** Chief never does any of these, and tells workers not to either. Accepting
+  work is always your call.
+- 🔐 **Checks run as you:** register only check commands you trust.
+- 🧪 **Untrusted content:** transcripts, screens and diffs are treated as untrusted data in every AI prompt.
+- 📁 **Trust prompts:** Codex's "trust this folder" prompt is answered only when you pass `--trust`.
+- ⚖️ **Big decisions need you:** they cannot be auto-accepted. Rules flag them (pushes, deletions, test changes,
+  goal or budget changes, protected paths, any red signal), and AI can only upgrade a decision from small to big,
+  never downgrade one.
 
-## License
+## 🗺️ Roadmap
 
-MIT. See [LICENSE](LICENSE).
+- [x] **Observe:** briefs built from native transcripts, the screen and git
+- [x] **A:** task contracts, `chief new`, executable checks, scope and protected paths, budgets
+- [x] **B:** decision queue and suggest mode
+- [x] **C:** auto-continue, recovery, stuck detection, session rotation, cross-model review
+- [ ] **D:** push notifications for 🔴 items, and per-category automatic decisions unlocked by your acceptance rate
+- [ ] A test suite in the repository
+
+The design rationale is in [docs/architecture.md](docs/architecture.md).
+
+## 🙏 Built on
+
+- [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires): the tmux-based session manager
+  Chief supervises.
+- [Codex CLI](https://github.com/openai/codex) and [Claude Code](https://github.com/anthropics/claude-code): the
+  workers, and each other's reviewers.
+
+## 📄 License
+
+[MIT](LICENSE) © 2026 Tianchi YU
