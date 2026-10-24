@@ -190,3 +190,7 @@ push notifications for 🔴 items and per-category automatic decisions, unlocked
 [docs/architecture.md](docs/architecture.md).
 
 Chief's command output and code comments are currently in Chinese.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
