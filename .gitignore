@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.chief/
+# Local working notes (analysis written by agents per the communication rules)
+notes/
