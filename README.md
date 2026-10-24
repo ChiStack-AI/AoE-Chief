@@ -126,6 +126,7 @@ its own later (`chief decisions --stats`).
 | Decide | `decisions [--all] [--stats]` | The decision queue |
 | | `decide <id> --accept / --reply TEXT / --dismiss [REASON] / --redraft / --ai` | Resolve one decision |
 | AI | `engine [codex\|claude]` | Default engine for briefs and drafts, and the model used at each level |
+| Settings | `lang [en\|zh]` | Output language |
 
 ## What `tick` does
 
@@ -148,6 +149,7 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | Key | Default | Meaning |
 |---|---|---|
 | `profile` | `main` | AoE profile |
+| `lang` | `en` | Output language: `en` or `zh`; the `AOE_CHIEF_LANG` environment variable overrides it. Messages to workers are always English |
 | `engine` | `codex` | AI engine for briefs and decision drafts |
 | `models` | see `chief engine` | Per-engine, per-level model and effort overrides |
 | `check_timeout` | 300 | Seconds per check command |
@@ -189,7 +191,6 @@ checks, the decision queue, auto-continue, stuck detection, session rotation and
 push notifications for 🔴 items and per-category automatic decisions, unlocked by your acceptance rate. See
 [docs/architecture.md](docs/architecture.md).
 
-Chief's command output and code comments are currently in Chinese.
 
 ## License
 
