@@ -59,6 +59,43 @@ def sep():
 
 # ---------- Basics ----------
 
+def redact(text):
+    """Mask credential values at ingestion, keeping labels and surrounding prose."""
+    mask = "••••"
+    text = re.sub(
+        r"(?P<begin>-----BEGIN (?P<kind>(?:[A-Z0-9]+ )*PRIVATE KEY)-----[ \t]*(?:\r?\n)?)"
+        r"[\s\S]*?(?P<end>(?:\r?\n)?-----END (?P=kind)-----|\Z)",
+        lambda m: m.group("begin") + mask + m.group("end"), text)
+
+    def secret_like(value):
+        return len(value) >= 6 and any(c.isdigit() or (not c.isalnum() and not c.isspace()) for c in value)
+
+    parts, end = [], 0
+    for m in re.finditer(
+        r"(?:(?<![a-z0-9])(?:password|passwd|token|secret(?:[ _-]?key)?|api[ _-]?key)(?![a-z0-9_])|密码|口令)"
+        r"(?:[\"'`]|\*\*)?"
+        r"(?:[ \t]*(?:is\b|是不是|是|为)\s*(?:[:=：]\s*)?|[ \t]*[:=：]\s*|[ \t]+)"
+        r"(?=(?:(?P<quote>[\"'`])(?P<quoted>[^\r\n]*?)(?:(?P=quote)|(?=\r?\n|\Z))"
+        r"|(?P<bare>[^\s\"'`<>\[\]{}(),;:，。！？；：（）【】“”‘’]+)))",
+        text, flags=re.I):
+        # Look ahead at values so a prose word cannot hide another label ("secret token = ...").
+        group = "quoted" if m.group("quoted") is not None else "bare"
+        value = m.group(group)
+        if group == "bare":
+            value = value.rstrip(".?")  # sentence punctuation belongs to the surrounding text
+        start = m.start(group)
+        if start >= end and secret_like(value):
+            parts.extend((text[end:start], mask))
+            end = start + len(value)
+    text = "".join(parts) + text[end:]
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,}"
+        r"|github_pat_[A-Za-z0-9_]{6,}|AKIA[A-Z0-9]{16})(?![A-Za-z0-9_])", mask, text)
+
+    return re.sub(
+        r"(\bBearer[ \t]+)[A-Za-z0-9._~+/-]{5,}[A-Za-z0-9_~+/-]=*",
+        lambda m: m.group(1) + mask, text, flags=re.I)
+
 def safe_write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -246,7 +283,7 @@ def claude_events(rows):
             ev.append((ts, "tool", ""))
         if m.get("stop_reason") == "end_turn":
             ev.append((ts, "done", ""))
-    return ev
+    return [(ts, kind, redact(text)) for ts, kind, text in ev]
 
 def codex_file(sid):
     hits = sorted(glob.glob(str(CODEX_HOME/"sessions"/"*"/"*"/"*"/("rollout-*-"+sid+".jsonl"))))
@@ -272,7 +309,7 @@ def codex_events(rows):
             ev.append((ts, "error", L("turn aborted: ", "回合被中断：") + str(p.get("reason", ""))))
         elif r.get("type") == "event_msg" and t == "error":
             ev.append((ts, "error", str(p.get("message", ""))))
-    return ev
+    return [(ts, kind, redact(text)) for ts, kind, text in ev]
 
 def transcript(rec):
     """Return {source, goal, title, last_prompt, last_reply, footer, turn, error, tools, last_ts, turns_total} or None."""
@@ -410,7 +447,7 @@ def screen(cfg, sid):
         return None
     if c.get("status") == "stopped" or not (c.get("content") or "").strip():
         return None
-    return c.get("content", "")
+    return redact(c.get("content", ""))
 
 def git_info(path):
     if not path or not os.path.isdir(path):
