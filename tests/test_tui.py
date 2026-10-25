@@ -58,7 +58,10 @@ class T(unittest.TestCase):
         self.assertTrue(dr["draft"] and dr["task"] == "shop-demo")
         self.assertFalse(dr["issues"])             # the review is for an older commit
         self.assertTrue(es[2]["issues"])
-        self.assertIsNone(es[0]["task"])           # a tracked session, not a board task: only o works
+        self.assertIsNone(es[0]["task"])           # a session that is gone: nothing to send to
+        self.assertNotIn("r reply", " ".join(tui.keys_for(chief, es[0])))
+        self.assertIn("r reply", " ".join(tui.keys_for(chief, es[3])))   # a tracked session: r goes to it directly
+        self.assertNotIn("d dismiss", " ".join(tui.keys_for(chief, es[3])))
         keys = " ".join(tui.keys_for(chief, dr))
         for k in ("a accept", "r reply", "d dismiss", "n nudge", "c close"):
             self.assertIn(k, keys)
@@ -114,6 +117,7 @@ class T(unittest.TestCase):
         ch.dismiss_decision = lambda d, r: calls.append(("dismiss", d["id"], r))
         ch.nudge = lambda cfg, t, text=None, rv=False: calls.append(("nudge", t["id"], text, rv)) or True
         ch.close_task = lambda cfg, t: calls.append(("close", t["id"])) or {"branch": "b"}
+        ch.reply_session = lambda cfg, sid, t: calls.append(("session", sid, t)) or True
         ch.collect = lambda cfg, checks, persist: {"items": items()}
         app = tui.Inbox({"profile": "main"}, ch, 15)
         app._refresh()
@@ -140,9 +144,13 @@ class T(unittest.TestCase):
         run("c", "y")
         run("b")                                   # no review issues on this commit: ignored
         run("j", "b", "y")
+        run("r", "o", "k", "\n")                  # a board task with no queued decision: r sends guidance
+        run("j", "r", "好", "\n")                 # a tracked session: r sends your words unchanged
+        run("k", "k", "k", "r", "x", "\n")        # the session that is gone: r does nothing
         self.assertEqual(calls, [("accept", "shop-demo:1"), ("reply", "shop-demo:1", "use J"),
                                  ("dismiss", "shop-demo:1", ""), ("nudge", "shop-demo", "go", False),
-                                 ("close", "shop-demo"), ("nudge", "review-zh", None, True)])
+                                 ("close", "shop-demo"), ("nudge", "review-zh", None, True),
+                                 ("nudge", "review-zh", "ok", False), ("session", "cccccccc3333", "好")])
         self.assertIn("not confirmed", "".join(str(app.st["msg"])) + " not confirmed")
         self.assertIs(app.key("q"), False)
 

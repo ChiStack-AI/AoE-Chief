@@ -396,7 +396,9 @@ def parse_footer(reply):
             found[k] = ""
     return found
 
-ASK_PATTERNS = re.compile(r"(Do you want to|\b(?:Allow|[Aa]pprove)\b|\(y/n\)|\[Y/n\]|Press enter|Yes, and|允许|是否继续)")   # "approved" in prose is not a prompt
+# An approval prompt starts its line; the same words inside a reply ("Decision needed: Approve the tests?") are prose.
+ASK_PATTERNS = re.compile(r"^[ \t│|›❯>•*-]*(?:Do you want to|Would you like to|(?:Allow|[Aa]pprove)\b|Press enter|Yes, and|允许|是否继续)"
+                          r"|\(y/n\)|\[Y/n\]", re.M)
 
 # ---------- Screen / git / artifacts ----------
 
@@ -502,7 +504,9 @@ def scope_info(path, task, extra_ignore=()):
 TASKS = ROOT / "tasks"
 ACTIVE = ("running", "needs-you", "review")
 TRUST_RE = re.compile(r"Trust this folder\?|Do you trust the files in this folder")
-INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts")   # the agent's input box is on screen
+# The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
+# shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
+INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
 
 def load_task(tid):
     p = TASKS/tid/"task.json"
@@ -1207,6 +1211,14 @@ def nudge(cfg, t, text=None, with_review=False):
     save_task(t)
     log_event(t, "nudge", L("you sent guidance", "你发了指示") + (L(" (with review issues)", "（附审查意见）") if with_review else ""))
     return ok
+
+def reply_session(cfg, sid, text):
+    """Send your own words, unchanged, to a session that is not a board task (such as a tracked conversation).
+    Chief never writes to tracked sessions on its own; this runs only when you typed the reply."""
+    if wait_ready(cfg, sid, False, timeout=20) != "ready":
+        raise RuntimeError(L("the session cannot take input now: run aoe session start {} or check the session",
+                             "会话现在不能输入：先 aoe session start {} 或进入会话处理").format(sid[:8]))
+    return deliver(cfg, sid, text, text[:40])
 
 def tick(cfg, dry=False):
     """One pass (with tick's own state file), then the automatic action for each board task."""

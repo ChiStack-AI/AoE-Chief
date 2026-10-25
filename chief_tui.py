@@ -130,10 +130,12 @@ def keys_for(ch, e):
     """The footer shows only the keys that do something for the selected entry."""
     L = ch.L
     k = []
+    if e and e["decision"] and e["draft"]:
+        k.append(L("a accept", "a 采纳"))
+    if e and e["status"] != "missing":
+        k.append(L("r reply", "r 回复"))       # a pending decision, a board task or any tracked session
     if e and e["decision"]:
-        if e["draft"]:
-            k.append(L("a accept", "a 采纳"))
-        k += [L("r reply", "r 回复"), L("d dismiss", "d 关闭决策")]
+        k.append(L("d dismiss", "d 关闭决策"))
     if e and e["task"]:
         k.append(L("n nudge", "n 指示"))
         if e["issues"]:
@@ -295,11 +297,19 @@ class Inbox:
         elif k == "a" and e and e["draft"]:
             self.job(L("sending the draft", "发送草稿"),
                      lambda: self.sent(ch.accept_decision(self.cfg, self.decision(e)), L("sent chief's draft", "已发送 chief 的草稿")))
-        elif k == "r" and e and e["decision"]:
+        elif k == "r" and e and e["decision"]:      # answers the queued decision, and records how you answered
             self.ask(L("Reply to {}: ", "回复 {}：").format(e["decision"]["id"]),
                      lambda text: self.job(L("sending your reply", "发送回复"),
                                            lambda: self.sent(ch.reply_decision(self.cfg, self.decision(e), text),
                                                              L("sent your decision", "已发送你的决定"))))
+        elif k == "r" and e and e["task"]:          # no queued decision: your words go to the worker as guidance
+            self.ask(L("Reply to {}: ", "回复 {}：").format(e["task"]),
+                     lambda text: self.job(L("sending your reply", "发送回复"),
+                                           lambda: self.sent(ch.nudge(self.cfg, self.task(e), text), L("sent", "已发送"))))
+        elif k == "r" and e and e["status"] != "missing":   # a tracked session: your words go in unchanged
+            self.ask(L("Reply to {}: ", "回复 {}：").format(e["title"]),
+                     lambda text: self.job(L("sending your reply", "发送回复"),
+                                           lambda: self.sent(ch.reply_session(self.cfg, e["sid"], text), L("sent", "已发送"))))
         elif k == "d" and e and e["decision"]:
             def dismiss(text):
                 ch.dismiss_decision(self.decision(e), text)

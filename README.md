@@ -176,8 +176,9 @@ chief inbox                      # check in whenever you like (or: chief brief)
  a accept  r reply  d dismiss  n nudge  c close  o open  t tick  g refresh  q quit  ↑↓ move
 ```
 
-The footer shows only the keys that apply to the selected item: `a` accept Chief's draft, `r` reply with your own
-decision, `d` dismiss it, `n` send the worker guidance, `b` send the review issues back, `c` close the task as done,
+The footer shows only the keys that apply to the selected item: `a` accept Chief's draft, `r` reply (to the pending
+decision if there is one, otherwise straight to the session: guidance for a board task, your words unchanged for a
+tracked session), `d` dismiss the decision, `n` send the worker guidance, `b` send the review issues back, `c` close the task as done,
 `o` open the session (inside tmux it switches to the agent's tmux session; `prefix L` comes back). Sends run in the
 background, so the inbox stays responsive. It refreshes every 15 seconds and never runs checks; `watch` does the
 driving.
