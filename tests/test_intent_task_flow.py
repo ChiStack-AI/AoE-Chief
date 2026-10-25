@@ -6,6 +6,7 @@ worker startup, and worker message delivery are mocked; no external session runs
 from contextlib import redirect_stderr, redirect_stdout
 import copy
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -190,6 +191,56 @@ class AcceptanceDecisionTests(ChiefFixture):
         self.decision = chief.sync_decisions(self.cfg, self.task, item)
         self.assertIsNotNone(self.decision, "the worker's approval request must enter the decision queue")
         self.record = {"id": self.task["session_id"], "project_path": str(self.repo)}
+
+    def test_test_approval_is_always_big_undrafted_and_requires_human_acceptance(self):
+        ai_answer = json.dumps({"size": "small", "category": "acceptance-tests", "choice": "approve",
+                                "reply": "Decision (from AoE Chief on the user's behalf): approve the tests."})
+        for autonomy in (None, "observe", "suggest", "auto"):
+            for decision_ai in (False, True):
+                with self.subTest(autonomy=autonomy, decision_ai=decision_ai):
+                    task = dict(self.task, id="approval-{}-{}".format(autonomy or "default", decision_ai),
+                                small_decisions=["acceptance-tests"])
+                    if autonomy is None:
+                        task.pop("autonomy")
+                    else:
+                        task["autonomy"] = autonomy
+                    chief.save_task(task)
+                    log = copy.deepcopy(self.log)
+                    # Supply a recommendation and avoid protected paths/risk words so those
+                    # unrelated vetoes cannot accidentally enforce the approval boundary.
+                    log["footer"]["decision"] += (
+                        " Options: A) approve B) revise. Recommendation: A, tests cover the goal.")
+                    item = {"id": task["session_id"], "task": task, "status": "idle", "log": log,
+                            "checks": {"passed": 1, "total": 1, "results": [{"ok": True}]},
+                            "git": {"head": self.tests_head, "dirty": 0, "branch": "chief/csv-import"}}
+                    item["signals"] = chief.judge(item)
+                    cfg = dict(self.cfg, decision_ai=decision_ai)
+                    classified_size = chief.classify(task, log["footer"], [])[0]
+                    with mock.patch.object(chief, "generate_ai", return_value=ai_answer), \
+                            mock.patch.object(chief, "accept_decision") as accept, \
+                            mock.patch.object(chief, "approve_tests", create=True) as approve, \
+                            mock.patch.object(chief, "deliver") as deliver, \
+                            mock.patch.object(chief, "review_task") as review:
+                        decision = chief.sync_decisions(cfg, task, item)
+                        self.assertIsNotNone(decision)
+                        item["decision"] = decision
+                        item["signals"] = chief.decision_signals(item["signals"], decision, log["footer"])
+                        with mock.patch.object(chief, "collect", return_value={"items": [item]}):
+                            chief.tick(cfg)
+                        accept.assert_not_called()
+                        approve.assert_not_called()
+                        deliver.assert_not_called()
+                        review.assert_not_called()
+                    queued = chief.find_decision(decision["id"])
+                    self.assertEqual(
+                        {"classified_size": classified_size, "size": decision["size"],
+                         "has_draft": bool(decision.get("draft")), "level": chief.level_of(item),
+                         "decision_signals": [level for level, _, kind in item["signals"] if kind == "decision"],
+                         "queued_size": queued["size"], "queued_has_draft": bool(queued.get("draft")),
+                         "queued_state": queued["state"], "phase": chief.load_task(task["id"])["phase"]},
+                        {"classified_size": "big", "size": "big", "has_draft": False, "level": "red",
+                         "decision_signals": ["red"], "queued_size": "big", "queued_has_draft": False,
+                         "queued_state": "pending", "phase": "test"})
 
     def test_decide_accept_approves_tests_then_sends_build_message(self):
         # Spy on the real helper when implemented, while keeping the red phase importable.
