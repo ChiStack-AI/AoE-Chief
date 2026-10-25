@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -643,15 +644,21 @@ def wait_ready(cfg, sid, trust, timeout=120):
         time.sleep(3)
     return "timeout"
 
-def start_task(cfg, t, trust=False):
-    cmd = [aoe_bin(), "-p", cfg["profile"], "add", t["repo"], "-t", t["name"][:60], "-w", t["branch"], "-b",
+def add_command(cfg, t, dry_run=False):
+    """Prepare the local task branch so AoE reuses it instead of choosing a remote base."""
+    if not dry_run:
+        git = ["git", "-C", t["repo"]]
+        if not call(git + ["branch", "--list", "--", t["branch"]], timeout=8).strip():
+            call(git + ["branch", "--", t["branch"], t.get("base_branch") or "HEAD"], timeout=8)
+    cmd = [aoe_bin(), "-p", cfg["profile"], "add", t["repo"], "-t", t["name"][:60], "-w", t["branch"],
            "--tool", t["tool"], "--launch"]
-    if t.get("base_branch"):
-        cmd += ["--base-branch", t["base_branch"]]
     for k in ("model", "effort"):
         if t.get(k):
             cmd += ["--" + k, t[k]]
-    out = call(cmd, timeout=120)
+    return cmd
+
+def start_task(cfg, t, trust=False):
+    out = call(add_command(cfg, t), timeout=120)
     sid = re.search(r"^\s*ID:\s*([0-9a-f]{16})", out, re.M)
     if not sid:
         raise RuntimeError(L("could not find the session ID in the aoe add output:\n",
@@ -1830,7 +1837,7 @@ def main():
             t.update(state="draft", created_at=now_utc().isoformat(), trust=bool(args.trust))
             if args.dry_run:
                 print(json.dumps(t, ensure_ascii=False, indent=2))
-                print("\n---- aoe add {} -t {!r} -w {} -b --tool {} --launch".format(t["repo"], t["name"], t["branch"], t["tool"]))
+                print("\n---- " + " ".join(shlex.quote(arg) for arg in add_command(cfg, t, dry_run=True)))
                 print(L("\n---- kickoff prompt ----\n", "\n---- 开场指令 ----\n") + kickoff_prompt(t))
                 return 0
             save_task(t)
