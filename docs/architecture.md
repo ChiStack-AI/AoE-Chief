@@ -58,9 +58,19 @@ Your judgment is worth the most at the start, so a task begins as a contract:
 }
 ```
 
+- You do not have to write it by hand. `chief new "<one sentence>"` drafts it: checks and protected paths are
+  inferred from the repository (pytest or unittest, `package.json`, a Makefile `test` target, `tests/`), then an
+  AI reads the repository to refine the draft. If the AI fails, the inferred defaults are used. You confirm with
+  Enter, or edit the draft.
+- **Test first.** By default a task starts in a test phase. The worker writes failing acceptance tests, commits
+  them, and asks you to approve them. That approval is always a big decision with no draft, in every autonomy
+  mode, and Chief neither auto-continues nor reviews before it. Approving locks the test files as protected and
+  resets the scope base to that commit. Reviewing a short test takes less time than writing it, and it is the
+  point where "done" gets defined.
 - Split a large task into several small ones, each with its own checks.
-- `chief new` creates a branch and git worktree (`aoe add -w <branch> -b --launch`), sends a kickoff prompt that
-  states the delegated-worker rules, and registers the task on the board.
+- `chief new` creates the task branch locally from the current HEAD (so unpushed commits are included), opens a
+  git worktree for it (`aoe add -w <branch> --launch`), sends a kickoff prompt that states the delegated-worker
+  rules, and registers the task on the board.
 
 ### 2. Execute: isolation and fresh context
 
@@ -126,10 +136,13 @@ Loop rules:
   `watch`, so closing the inbox never stops a task.
 - Each board task's level is mirrored onto its AoE color dot (red: needs you, amber: working, green: to accept),
   so the AoE dashboard shows it too. Chief calls AoE only when the color changes.
+- Both the inbox and `watch` can run as standing AoE sessions (custom agents), so tasks keep moving when no
+  terminal of yours is open.
 
 ## Where accuracy comes from
 
 1. Executable checks and protected tests: completion is objective, and the agent cannot pass by editing the tests.
+   In the test phase you approve the tests themselves, so the checks measure what you meant.
 2. Isolated worktrees: every change has an owner and can be rolled back.
 3. Cross-model review: the same model never writes and reviews the same work.
 4. Fresh context plus `progress.md`: long tasks do not degrade late in the task.
@@ -167,7 +180,12 @@ Loop rules:
   - Claude sessions follow `continued-in` links and skip title-only stub files.
   - Codex sessions use `task_complete` and `turn_aborted`.
 - AoE may report `idle` before the agent's input box is ready, and `waiting` after a finished turn. Readiness is
-  therefore judged from the screen: the input box is visible, there is no approval prompt and no trust prompt.
+  therefore judged from the screen: the input box is visible (Claude's box itself counts, since auto mode hides the
+  "? for shortcuts" hint), there is no approval prompt and no trust prompt. Approval words count only at the start
+  of a line, so "Decision needed: Approve the tests?" in a reply is prose, not a prompt.
+- Secrets are masked where agent text enters Chief (both transcript parsers and the screen capture), so the brief,
+  inbox, state files, decisions, review material and AI prompts never carry them. Masked: values after
+  password-like keywords, well-known token formats and private key blocks.
 - Kickoffs and decisions are sent with `aoe send`. Delivery is confirmed by the session turning `running`, or by
   the message appearing on screen.
 - A pending decision is marked superseded if the session moved on, for example because you answered inside the

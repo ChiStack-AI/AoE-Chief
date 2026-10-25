@@ -175,7 +175,7 @@ chief new --repo ~/workspace/myproj --name "parser fix" \
   --goal "Make the parser accept trailing commas" \
   --check "pytest tests/parser -q" --scope src/parser --protected tests \
   --rounds 10 --hours 3          # add --dry-run to preview the contract and the kickoff prompt
-chief watch --every 300          # keep this running in a tmux window
+chief watch --every 300          # or run it as a standing AoE session (see below)
 chief inbox                      # check in whenever you like (or: chief brief)
 ```
 
@@ -202,14 +202,22 @@ tracked session), `d` dismiss the decision, `n` send the worker guidance, `b` se
 background, so the inbox stays responsive. It refreshes every 15 seconds and never runs checks; `watch` does the
 driving.
 
-To keep the inbox as its own session in AoE, register it as a custom agent in `~/.config/agent-of-empires/config.toml`:
+To keep the inbox and the driver as standing sessions in AoE, register them as custom agents in
+`~/.config/agent-of-empires/config.toml`:
 
 ```toml
 [session]
-custom_agents = { chief = "python3 /home/you/aoe-chief/chief.py inbox" }
+custom_agents = { chief = "python3 /home/you/aoe-chief/chief.py inbox", chief-watch = "python3 /home/you/aoe-chief/chief.py watch --every 300" }
 ```
 
-Then run `aoe add ~/aoe-chief -t "chief inbox" --tool chief --launch`.
+```bash
+aoe add ~/aoe-chief -t "chief inbox" --tool chief --launch
+aoe add ~/aoe-chief -t "chief watch" --tool chief-watch --launch
+```
+
+Then tasks keep moving without a terminal of yours open, and the AoE sidebar shows whether `watch` is alive. After
+updating Chief, restart these two with `aoe session stop` and `aoe session start`, not `aoe session restart`:
+restart types a wake message into the session, and the inbox would read its letters as keys.
 
 **Thinking tasks** are open-ended conversations. You talk to the agent directly. Chief can still watch those
 sessions and summarize them (`chief track <session>`), but it does not drive them.
@@ -304,7 +312,10 @@ $AOE_CHIEF_HOME/
   work is always your call.
 - 🔐 **Checks run as you:** register only check commands you trust.
 - 🧪 **Untrusted content:** transcripts, screens and diffs are treated as untrusted data in every AI prompt.
-- 📁 **Trust prompts:** Codex's "trust this folder" prompt is answered only when you pass `--trust`.
+- 📁 **Trust prompts:** Codex's "trust this folder" prompt is answered only when you pass `--trust`. Claude's
+  newer trust prompt wording is not recognised yet, so prefer Codex workers with `--trust`.
+- 🙈 **Secrets masked:** passwords, tokens, API keys and private keys in transcripts and screens are masked as they
+  are read, before Chief stores, shows or forwards anything.
 - ⚖️ **Big decisions need you:** they cannot be auto-accepted. Rules flag them (pushes, deletions, test changes,
   goal or budget changes, protected paths, any red signal), and AI can only upgrade a decision from small to big,
   never downgrade one.
@@ -317,7 +328,11 @@ $AOE_CHIEF_HOME/
 - [x] **C:** auto-continue, recovery, stuck detection, session rotation, cross-model review
 - [ ] **D:** push notifications for 🔴 items, and per-category automatic decisions unlocked by your acceptance rate
 - [x] **Inbox:** an interactive terminal inbox and AoE color dots
-- [ ] A fuller test suite in the repository (`python3 -m unittest discover -s tests` covers the inbox so far)
+- [x] **Intent tasks:** `chief new "<one sentence>"` with drafted contracts, and a test-first approval phase
+- [x] **Secret masking** at ingestion
+- [x] A test suite in the repository (`python3 -m unittest discover -s tests`)
+- [ ] Inbox: `N` to delegate a task in one line, and separate groups for delegated and thinking work
+- [ ] Recognise Claude's newer trust prompt
 
 The design rationale is in [docs/architecture.md](docs/architecture.md).
 
