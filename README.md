@@ -152,6 +152,25 @@ chief close shop-demo           # or: chief nudge shop-demo "also format prices 
 **Delegated tasks** have a clear goal and objective checks. Create each one as a task:
 
 ```bash
+cd ~/workspace/myproj
+chief new "Make the parser accept trailing commas"
+# Enter accepts the draft; e opens it in $EDITOR; n aborts. --yes skips confirmation.
+```
+
+Chief infers checks from pytest configuration or `tests/` (using unittest discovery for unittest suites),
+a `package.json` test script, and a Makefile `test` target. Existing `tests/` and `test/` directories become
+protected. An AI reads the repo to refine the name, goal, checks, protections and budget; unavailable or failed
+AI generation falls back to the inferred defaults. `--repo` selects another repository.
+
+New tasks begin with a test phase: the worker writes failing acceptance tests, commits them, and asks you to
+approve the files. This is always a big decision with no Chief draft, including in auto mode. Accept it with
+`chief decide <decision-id> --accept` or `a` in the inbox to protect those tests and begin implementation.
+Reply with feedback to keep revising the tests. Chief does not automatically continue or review work before
+this approval. Add `--no-test-first` to begin implementation immediately.
+
+The existing flag-based form also works, without AI drafting or a contract confirmation prompt:
+
+```bash
 chief new --repo ~/workspace/myproj --name "parser fix" \
   --goal "Make the parser accept trailing commas" \
   --check "pytest tests/parser -q" --scope src/parser --protected tests \
