@@ -514,7 +514,7 @@ def ignored(rel, patterns):
     return any(fnmatch.fnmatch(part, p) for part in rel.split("/") for p in patterns)
 
 def scope_info(path, task, extra_ignore=()):
-    """Of the files changed since the task's base commit, which are out of scope and which are protected."""
+    """Scope/protection since base; acceptance tests may change during the test phase."""
     scope, protected = task.get("scope"), task.get("protected") or []
     if not (scope or protected) or not path:
         return None
@@ -531,9 +531,11 @@ def scope_info(path, task, extra_ignore=()):
         d = os.path.normpath(os.path.join(path, d))
         return f == d or f.startswith(d.rstrip("/") + "/")
     rel = lambda f: os.path.relpath(f, path)
+    test_dirs = infer_protected(path) if in_test_phase(task) else []
     return {"base": (task.get("base") or "")[:10], "changed": len(files),
             "out_of_scope": [rel(f) for f in files if scope and not under(f, scope)][:20],
-            "protected_touched": [rel(f) for f in files if any(under(f, d) for d in protected)][:20]}
+            "protected_touched": [rel(f) for f in files if any(under(f, d) for d in protected)
+                                  and not any(under(f, d) for d in test_dirs)][:20]}
 
 # ---------- Task board ----------
 # One directory per task: tasks/<id>/task.json. The task is the source of truth; sessions only execute it.
@@ -756,9 +758,11 @@ def kickoff_prompt(t, resume=False):
     lines += ["", "## Boundaries",
               "- Only modify files under: " + (t.get("scope") or "this repository")]
     if t.get("protected"):
-        lines.append(("- Never modify existing files in: " if testing else "- Never modify: ") + ", ".join(t["protected"]))
+        lines.append(("- Protected paths (acceptance tests may change during the test phase): " if testing else
+                      "- Never modify: ") + ", ".join(t["protected"]))
     if testing:
-        lines.append("- During this phase you may add new acceptance tests in test directories, including protected ones.")
+        lines.append("- During this phase you may add or revise acceptance tests in test directories, including protected ones.")
+        lines.append("- All other protected files must remain unchanged.")
     lines.append("- Never push, merge, deploy, or delete branches. Work only on the current branch.")
     b = t.get("budget") or {}
     if b:

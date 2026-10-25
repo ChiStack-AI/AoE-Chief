@@ -8,6 +8,44 @@ import chief_tui as tui
 import test_intent_task_flow as flow
 
 
+class ScopePhaseTests(flow.ChiefFixture):
+    def setUp(self):
+        super().setUp()
+        self.write("tests/test_existing.py", "# original tests\n")
+        self.write("secrets.env", "original configuration\n")
+        self.write("src/application.py", "# original implementation\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "scope baseline")
+        self.task = {"repo": str(self.repo), "base": self.git("rev-parse", "HEAD"),
+                     "scope": "src", "protected": ["tests", "secrets.env"],
+                     "test_first": True, "phase": "test"}
+        self.write("tests/test_existing.py", "# revised acceptance tests\n")
+        self.write("tests/test_new_acceptance.py", "# new acceptance tests\n")
+        self.write("secrets.env", "changed configuration\n")
+        self.write("src/application.py", "# changed implementation\n")
+
+    def test_test_phase_exempts_acceptance_tests_but_preserves_other_scope_checks(self):
+        for stage in ("untracked", "staged", "committed"):
+            with self.subTest(stage=stage):
+                if stage == "staged":
+                    self.git("add", "tests")
+                elif stage == "committed":
+                    self.git("commit", "-q", "-m", "Revise and add acceptance tests")
+                scope = chief.scope_info(str(self.repo), self.task)
+                self.assertEqual(scope["protected_touched"], ["secrets.env"])
+                self.assertEqual(scope["changed"], 4)
+                self.assertCountEqual(scope["out_of_scope"],
+                                      ["tests/test_existing.py", "tests/test_new_acceptance.py", "secrets.env"])
+
+    def test_build_and_legacy_tasks_still_flag_protected_test_changes(self):
+        for task in (dict(self.task, phase="build"),
+                     {k: v for k, v in self.task.items() if k not in ("test_first", "phase")}):
+            with self.subTest(phase=task.get("phase", "legacy")):
+                scope = chief.scope_info(str(self.repo), task)
+                self.assertCountEqual(scope["protected_touched"],
+                                      ["tests/test_existing.py", "tests/test_new_acceptance.py", "secrets.env"])
+
+
 class IntentInteractionTests(flow.ChiefFixture):
     def test_abort_creates_no_task_or_worker(self):
         with mock.patch.object(chief, "generate_ai", side_effect=RuntimeError("offline")), \
