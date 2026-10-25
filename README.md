@@ -216,6 +216,9 @@ sessions and summarize them (`chief track <session>`), but it does not drive the
 | | `decide <id> --accept \| --reply TEXT \| --dismiss [REASON]` | Resolve a decision (`--redraft` / `--ai` re-judge it) |
 | ⚙️ Settings | `engine [codex\|claude]`, `lang [en\|zh]` | AI engine and models per level; output language |
 
+For `task <id>`, `--parked` suppresses inactivity reports and `--unpark` enables them again.
+Omitting both flags preserves the task's parked state.
+
 <details>
 <summary><b>What <code>tick</code> does, situation by situation</b></summary>
 

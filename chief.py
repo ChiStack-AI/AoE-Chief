@@ -1654,7 +1654,11 @@ def main():
     tk.add_argument("--goal")
     tk.add_argument("--done-when", dest="done_when")
     tk.add_argument("--artifact", help=L("deliverable path (relative to the project)", "交付物路径（相对项目目录）"))
-    tk.add_argument("--parked", action="store_true", help=L("parked: do not report long inactivity", "暂时搁置：不报告长期无活动"))
+    parking = tk.add_mutually_exclusive_group()
+    parking.add_argument("--parked", action="store_true", default=None,
+                         help=L("parked: do not report long inactivity", "暂时搁置：不报告长期无活动"))
+    parking.add_argument("--unpark", action="store_false", dest="parked",
+                         help=L("unpark: report long inactivity again", "取消搁置：恢复报告长期无活动"))
     tk.add_argument("--check", action="append", dest="checks", metavar="CMD",
                     help=L("executable done check (bash -c in the project; exit 0 = pass); repeatable",
                            "可执行的完成检查（项目目录下 bash -c 运行，退出码 0 为通过），可重复"))
@@ -1880,7 +1884,8 @@ def main():
                 t["checks"] = t.get("checks", []) + [c for c in args.checks if c not in t.get("checks", [])]
             if args.protected:
                 t["protected"] = t.get("protected", []) + [p for p in args.protected if p not in t.get("protected", [])]
-            t["parked"] = bool(args.parked)
+            if args.parked is not None:
+                t["parked"] = args.parked
             if (t.get("scope") or t.get("protected")) and (args.rebase or not t.get("base")):
                 t["base"] = git_head(aoe_records(cfg).get(sid, {}).get("project_path", ""))   # the scope check counts from here
             if sid in board:
