@@ -121,6 +121,11 @@ Loop rules:
 - **🔴** big decisions, stuck tasks, protected files touched, failed reviews.
 - **📝 / ✅** drafted small decisions and review cards, handled in batches.
 - The brief also lists what Chief did automatically since the last brief.
+- `chief inbox` is the interactive form of the same triage: a curses list with one key per action. It runs the
+  same pass as the brief without checks, every 15 seconds, and sends in a background thread. Automation stays in
+  `watch`, so closing the inbox never stops a task.
+- Each board task's level is mirrored onto its AoE color dot (red: needs you, amber: working, green: to accept),
+  so the AoE dashboard shows it too. Chief calls AoE only when the color changes.
 
 ## Where accuracy comes from
 

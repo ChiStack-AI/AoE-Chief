@@ -6,7 +6,7 @@
 set -euo pipefail
 REPO=~/workspace/chief-demo
 export AOE_CHIEF_HOME=~/.local/state/aoe-chief-demo
-C="python3 $(dirname "$0")/chief.py"
+C="python3 $(cd "$(dirname "$0")" && pwd)/chief.py"
 AOE=~/.local/bin/aoe
 
 if [ "${1:-}" = clean ]; then

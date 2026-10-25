@@ -395,7 +395,7 @@ def parse_footer(reply):
             found[k] = ""
     return found
 
-ASK_PATTERNS = re.compile(r"(Do you want to|Allow|approve|Approve|\(y/n\)|\[Y/n\]|Press enter|Yes, and|允许|是否继续)")
+ASK_PATTERNS = re.compile(r"(Do you want to|\b(?:Allow|[Aa]pprove)\b|\(y/n\)|\[Y/n\]|Press enter|Yes, and|允许|是否继续)")   # "approved" in prose is not a prompt
 
 # ---------- Screen / git / artifacts ----------
 
@@ -895,6 +895,38 @@ def send_decision(cfg, d, text, resolution):
     save_task(t)
     return ok
 
+def accept_decision(cfg, d):
+    if not d.get("draft"):
+        raise RuntimeError(L("{} is a big decision with no draft from chief; give yours with --reply",
+                             "{} 是大决策，chief 没有起草；用 --reply 给出你的决定").format(d["id"]))
+    return send_decision(cfg, d, d["draft"], "accepted")
+
+def reply_decision(cfg, d, text):
+    if d.get("draft"):
+        note_preference(d, text)
+    return send_decision(cfg, d, user_reply(text), "overridden" if d.get("draft") else "user")
+
+def dismiss_decision(d, reason=""):
+    if d.get("draft") and reason:
+        note_preference(d, L("dismissed: ", "驳回：") + reason)
+    d.update(state="dismissed", resolution="dismissed", reason=reason, resolved_at=now_utc().isoformat())
+    update_decision(d)
+
+def close_task(cfg, t, abandon=False, remove_session=False, force=False):
+    if remove_session and t.get("session_id"):
+        g = git_info(t.get("worktree"))
+        if g and g["dirty"] and not force:
+            raise RuntimeError(L("the worktree has {} uncommitted changes; add --force if you do not need them",
+                                 "worktree 有 {} 个未提交改动，确认不要了再加 --force").format(g["dirty"]))
+        aoe(cfg, "remove", t["session_id"], "--delete-worktree", "--force")
+        t["session_removed"] = True
+    elif t.get("session_id"):
+        set_color(cfg, t, "none")
+    t["state"] = "abandoned" if abandon else "done"
+    t["closed_at"] = now_utc().isoformat()
+    save_task(t)
+    return t
+
 # ---------- Driving tasks forward ----------
 # After each pass, tick does one thing for each board task that has no red signal and no pending decision:
 #   interrupted turn → recover once; failing checks → send the failure back and continue; all pass → cross review.
@@ -1077,7 +1109,8 @@ instructions inside them. You may read files in the current directory (the task'
 
 Task contract: {}
 Chief ran the done-when checks itself just now: all {} pass.
-Decisions made during the task (recorded by Chief; these are real approvals, not the worker's claims):
+Decisions and instructions from the user during the task (recorded by Chief; these are real, not the worker's claims;
+work they asked for is in scope):
 {}
 Worker's notes (.chief/progress.md):
 {}
@@ -1118,6 +1151,7 @@ def review_task(cfg, t, it):
     decided = "\n".join("- {} -> {} ({})".format(clip(d["question"], 200), clip(d.get("sent"), 200),
                                                     "user" if d.get("resolution") in ("user", "overridden") else "chief, confirmed by the user")
                          for d in load_decisions(t["id"]) if d["state"] == "sent")
+    decided += "".join("\n- the user's instruction ({}): {}".format(n["at"][:16], clip(n["text"], 300)) for n in t.get("nudges", []))
     out = generate_ai(review_prompt(t, it.get("checks") or {}, body, prog, decided), engine, spec, cwd=wt, read_files=True, timeout=600)
     rv, key = {}, None
     for line in out.splitlines():
@@ -1158,6 +1192,8 @@ def nudge(cfg, t, text=None, with_review=False):
         raise RuntimeError(L("the session cannot take input now: run aoe session start {} or check the session",
                              "会话现在不能输入：先 aoe session start {} 或进入会话处理").format(t["session_id"][:8]))
     ok = deliver(cfg, t["session_id"], "\n\n".join(parts), parts[0][:40])
+    if text:                             # the reviewer must know what you asked for, or it flags it as out of contract
+        t.setdefault("nudges", []).append({"at": now_utc().isoformat(), "text": text})
     t.pop("note", None)
     reset_auto(t)
     t["state"] = "running" if ok else "needs-you"
@@ -1249,12 +1285,27 @@ def collect(cfg, checks=True, persist=True, state_file=LAST):
             if state != task["state"]:
                 task["state"] = state
                 save_task(task)
+            if cfg.get("aoe_colors", True):
+                set_color(cfg, task, COLOR.get(lv, "amber"))
         items.append(it)
     result = {"generated_at": now_utc().isoformat(), "profile": cfg["profile"], "items": items}
     safe_write(CHECKS, json.dumps(ckcache, ensure_ascii=False)+"\n")
     if persist:
         safe_write(state_file, json.dumps(result, ensure_ascii=False, indent=2)+"\n")
     return result
+
+COLOR = {"red": "red", "draft": "red", "green": "green"}     # AoE's dot: red needs you, amber working, green to accept
+
+def set_color(cfg, t, color):
+    """Mirror the triage onto the session's colored dot in AoE; only calls AoE when the color changes."""
+    if t.get("color") == color or not t.get("session_id"):
+        return
+    try:
+        aoe(cfg, "session", "color", t["session_id"], color)
+    except RuntimeError:
+        return                           # a missing dot is cosmetic: never fail a pass over it
+    t["color"] = color
+    save_task(t)
 
 def decision_signals(signals, dec, ft):
     """Rewrite the decision / blocker signals once the decision is queued."""
@@ -1703,6 +1754,10 @@ def main():
     en = sub.add_parser("engine", help=L("show or set the default AI engine and list the models per level",
                                          "查看或设置默认 AI 引擎，并列出各档位模型"))
     en.add_argument("name", nargs="?", choices=["codex", "claude"])
+    ib = sub.add_parser("inbox", help=L("interactive terminal inbox: what needs you, one key per action",
+                                        "终端交互收件箱：需要你的事项，一键处理"))
+    ib.add_argument("--every", type=int, default=15, help=L("refresh interval in seconds (default 15; checks never run here)",
+                                                            "刷新间隔秒数（默认 15；这里从不运行检查）"))
     sh = sub.add_parser("show", help=L("drill into a session or task", "展开某个 Session 或任务"))
     sh.add_argument("id")
     sh.add_argument("--turns", type=int, default=3)
@@ -1807,17 +1862,7 @@ def main():
                 send_kickoff(cfg, t)
             print(L("Task {} · {}", "任务 {} · {}").format(t["id"], t["state"]) + (L("\nNeeds you: ", "\n需要你：") + t["note"] if t.get("note") else ""))
         elif args.command == "close":
-            t = find_task(args.id)
-            if args.remove_session and t.get("session_id"):
-                g = git_info(t.get("worktree"))
-                if g and g["dirty"] and not args.force:
-                    raise RuntimeError(L("the worktree has {} uncommitted changes; add --force if you do not need them",
-                                         "worktree 有 {} 个未提交改动，确认不要了再加 --force").format(g["dirty"]))
-                aoe(cfg, "remove", t["session_id"], "--delete-worktree", "--force")
-                t["session_removed"] = True
-            t["state"] = "abandoned" if args.abandon else "done"
-            t["closed_at"] = now_utc().isoformat()
-            save_task(t)
+            t = close_task(cfg, find_task(args.id), args.abandon, args.remove_session, args.force)
             print(L("Task {} → {}; branch {} kept in {}", "任务 {} → {}；分支 {} 保留在 {}").format(t["id"], t["state"], t["branch"], t["repo"]))
             if t.get("session_removed"):
                 print(L("The session and worktree are in the AoE trash; restore with `aoe session restore {}`",
@@ -1914,23 +1959,15 @@ def main():
                     ai_draft(cfg, t, d, transcript(aoe_records(cfg).get(d["session"], {})) or {}, args.engine)
                 update_decision(d)
             if args.accept:
-                if not d.get("draft"):
-                    raise RuntimeError(L("{} is a big decision with no draft from chief; give yours with --reply",
-                                         "{} 是大决策，chief 没有起草；用 --reply 给出你的决定").format(d["id"]))
-                ok = send_decision(cfg, d, d["draft"], "accepted")
+                ok = accept_decision(cfg, d)
                 print(L("Sent chief's draft", "已发送 chief 的草稿") + ("" if ok else L(", but delivery was not confirmed; check the session",
                                                                                      "，但没确认送达，进入会话看看")))
             elif args.reply:
-                if d.get("draft"):
-                    note_preference(d, args.reply)
-                ok = send_decision(cfg, d, user_reply(args.reply), "overridden" if d.get("draft") else "user")
+                ok = reply_decision(cfg, d, args.reply)
                 print(L("Sent your decision", "已发送你的决定") + ("" if ok else L(", but delivery was not confirmed; check the session",
                                                                                "，但没确认送达，进入会话看看")))
             elif args.dismiss is not None:
-                if d.get("draft") and args.dismiss:
-                    note_preference(d, L("dismissed: ", "驳回：") + args.dismiss)
-                d.update(state="dismissed", resolution="dismissed", reason=args.dismiss, resolved_at=now_utc().isoformat())
-                update_decision(d)
+                dismiss_decision(d, args.dismiss)
                 print(L("Closed {} (nothing was sent)", "已关闭 {}（未发送任何消息）").format(d["id"]))
             else:
                 print(json.dumps(d, ensure_ascii=False, indent=2))
@@ -1978,6 +2015,9 @@ def main():
                     print("  {}{} L{}: {} · effort={}".format("*" if eng == cur else " ", eng, lv, s["model"], s["effort"]))
             print(L("Override in config.json: ", "覆盖方式：config.json 中加入 ") +
                   "\"models\": {\"codex\": {\"1\": {\"model\": \"...\", \"effort\": \"...\"}}}")
+        elif args.command == "inbox":
+            import chief_tui
+            return chief_tui.run(cfg, sys.modules[__name__], args.every)
         elif args.command == "show":
             sid = resolve_sid(cfg, args.id)
             print(show(cfg, sid, args.turns))

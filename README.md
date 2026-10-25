@@ -84,6 +84,9 @@ $ chief brief
   card.
 - **🧾 Learns your taste:** every override is written to `preferences.md`, and acceptance rates show what could
   be automated next.
+- **📥 Terminal inbox:** `chief inbox` lists what needs you and handles it with one key: accept a draft, reply,
+  send back a review, close a task, or jump into the session. Each task's state also shows as a colored dot in
+  AoE.
 - **🌐 English or Chinese output:** switch with `chief lang en|zh`.
 
 ## 🧭 How it works
@@ -137,8 +140,8 @@ and a cross review. The demo state lives in its own directory, so your real boar
 ~/aoe-chief/demo.sh
 export AOE_CHIEF_HOME=~/.local/state/aoe-chief-demo
 chief watch --every 30          # terminal 2: let Chief drive
-chief brief                     # what needs you?
-chief decide shop-demo:1 --accept
+chief inbox                     # what needs you? press a to accept the drafted decision
+chief decide shop-demo:1 --accept   # the same from the command line
 cat $AOE_CHIEF_HOME/tasks/shop-demo/review.md
 chief close shop-demo           # or: chief nudge shop-demo "also format prices with 2 decimals"
 ~/aoe-chief/demo.sh clean
@@ -154,8 +157,39 @@ chief new --repo ~/workspace/myproj --name "parser fix" \
   --check "pytest tests/parser -q" --scope src/parser --protected tests \
   --rounds 10 --hours 3          # add --dry-run to preview the contract and the kickoff prompt
 chief watch --every 300          # keep this running in a tmux window
-chief brief                      # check in whenever you like
+chief inbox                      # check in whenever you like (or: chief brief)
 ```
+
+### 📥 The inbox
+
+```text
+ AoE Chief · 1 needs you · 1 to confirm · 1 to accept · 4 tracked          last tick 2m ago · 14:05
+ [!] csv import            3f7b88ca  codex   idle      12m ago  protected files changed: tests/test_io.py
+ [?] shop demo             f29dfc6f  codex   idle       3m ago  chief drafted decision shop-demo:1: A) plain text
+ [+] parser fix            62f82720  claude  idle      40m ago  all checks pass (3/3), ready for you to accept
+ [ ] explore               9a1c03de  claude  running    0m ago
+── shop demo ───────────────────────────────────────────────────────────────────────────────────────
+ Decision shop-demo:1 (small, by rules)
+ Q: Should receipt() return plain text lines or JSON? Recommendation: A) plain text
+ Chief's draft: A) plain text
+ ...
+ a accept  r reply  d dismiss  n nudge  c close  o open  t tick  g refresh  q quit  ↑↓ move
+```
+
+The footer shows only the keys that apply to the selected item: `a` accept Chief's draft, `r` reply with your own
+decision, `d` dismiss it, `n` send the worker guidance, `b` send the review issues back, `c` close the task as done,
+`o` open the session (inside tmux it switches to the agent's tmux session; `prefix L` comes back). Sends run in the
+background, so the inbox stays responsive. It refreshes every 15 seconds and never runs checks; `watch` does the
+driving.
+
+To keep the inbox as its own session in AoE, register it as a custom agent in `~/.config/agent-of-empires/config.toml`:
+
+```toml
+[session]
+custom_agents = { chief = "python3 /home/you/aoe-chief/chief.py inbox" }
+```
+
+Then run `aoe add ~/aoe-chief -t "chief inbox" --tool chief --launch`.
 
 **Thinking tasks** are open-ended conversations. You talk to the agent directly. Chief can still watch those
 sessions and summarize them (`chief track <session>`), but it does not drive them.
@@ -169,6 +203,7 @@ sessions and summarize them (`chief track <session>`), but it does not drive the
 | Area | Command | What it does |
 |---|---|---|
 | 👀 Observe | `sessions`, `track`, `untrack` | Pick AoE sessions to watch |
+| | `inbox [--every SEC]` | Interactive terminal inbox: one key per action |
 | | `brief [--ai] [--level 1-3]` | Triage report; with `--ai`, a model writes it from the facts |
 | | `show <id> [--turns N]` | Drill into one task: progress file, checks, decisions, recent turns |
 | | `task <id> --goal --check ...` | Attach a goal and checks to a session you did not create with `new` |
@@ -214,6 +249,7 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `decision_ai` | `false` | Let AI re-judge and draft new decisions |
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
 | `review`, `review_engine`, `review_level` | `true`, the other engine, 2 | Cross review |
+| `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
 
 If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set
 `AOE_BIN`.
@@ -257,7 +293,8 @@ $AOE_CHIEF_HOME/
 - [x] **B:** decision queue and suggest mode
 - [x] **C:** auto-continue, recovery, stuck detection, session rotation, cross-model review
 - [ ] **D:** push notifications for 🔴 items, and per-category automatic decisions unlocked by your acceptance rate
-- [ ] A test suite in the repository
+- [x] **Inbox:** an interactive terminal inbox and AoE color dots
+- [ ] A fuller test suite in the repository (`python3 -m unittest discover -s tests` covers the inbox so far)
 
 The design rationale is in [docs/architecture.md](docs/architecture.md).
 
