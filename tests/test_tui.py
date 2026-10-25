@@ -53,24 +53,25 @@ class T(unittest.TestCase):
 
     def test_entries_order_and_actions(self):
         es = tui.entries(chief, {"items": items()})
-        self.assertEqual([e["level"] for e in es], ["red", "draft", "green", "grey"])
-        dr = es[1]
+        # Delegated tasks precede thinking sessions; urgency still sorts each group.
+        self.assertEqual([e["level"] for e in es], ["draft", "green", "red", "grey"])
+        dr = es[0]
         self.assertTrue(dr["draft"] and dr["task"] == "shop-demo")
         self.assertFalse(dr["issues"])             # the review is for an older commit
-        self.assertTrue(es[2]["issues"])
-        self.assertIsNone(es[0]["task"])           # a session that is gone: nothing to send to
-        self.assertNotIn("r reply", " ".join(tui.keys_for(chief, es[0])))
+        self.assertTrue(es[1]["issues"])
+        self.assertIsNone(es[2]["task"])           # a session that is gone: nothing to send to
+        self.assertNotIn("r reply", " ".join(tui.keys_for(chief, es[2])))
         self.assertIn("r reply", " ".join(tui.keys_for(chief, es[3])))   # a tracked session: r goes to it directly
         self.assertNotIn("d dismiss", " ".join(tui.keys_for(chief, es[3])))
         keys = " ".join(tui.keys_for(chief, dr))
         for k in ("a accept", "r reply", "d dismiss", "n nudge", "c close"):
             self.assertIn(k, keys)
         self.assertNotIn("b send back", keys)
-        self.assertIn("b send back", " ".join(tui.keys_for(chief, es[2])))
-        self.assertNotIn("n nudge", " ".join(tui.keys_for(chief, es[0])))
+        self.assertIn("b send back", " ".join(tui.keys_for(chief, es[1])))
+        self.assertNotIn("n nudge", " ".join(tui.keys_for(chief, es[2])))
 
     def check_render(self):
-        st = {"entries": tui.entries(chief, {"items": items()}), "sel": 1, "scroll": 0, "msg": "hi", "clock": "12:00",
+        st = {"entries": tui.entries(chief, {"items": items()}), "sel": 0, "scroll": 0, "msg": "hi", "clock": "12:00",
               "tick_note": "last tick 1m ago"}
         for w, h in ((100, 30), (60, 16), (40, 10), (200, 50)):
             rows = tui.render(chief, st, w, h)
@@ -108,7 +109,7 @@ class T(unittest.TestCase):
         class Fake:
             pass
         ch = Fake()
-        for name in ("L", "RANK", "ACTIVE", "level_of", "ago", "clip", "sep", "TICK"):
+        for name in ("L", "RANK", "ACTIVE", "level_of", "ago", "clip", "sep", "TICK", "call"):
             setattr(ch, name, getattr(chief, name))
         ch.find_decision = lambda i: {"id": i, "state": "pending"}
         ch.load_task = lambda i: {"id": i}
@@ -119,6 +120,7 @@ class T(unittest.TestCase):
         ch.close_task = lambda cfg, t: calls.append(("close", t["id"])) or {"branch": "b"}
         ch.reply_session = lambda cfg, sid, t: calls.append(("session", sid, t)) or True
         ch.collect = lambda cfg, checks, persist: {"items": items()}
+        ch.all_tasks = lambda: []
         app = tui.Inbox({"profile": "main"}, ch, 15)
         app._refresh()
 
@@ -132,7 +134,7 @@ class T(unittest.TestCase):
                     app.key(k)
                 while app.st["busy"]:
                     pass
-        run("j")                                   # select the drafted decision
+        # The first delegated task is the drafted decision.
         self.assertEqual(app.selected()["level"], "draft")
         run("a")
         run("r", "u", "s", "e", " ", "中", "KEY_BACKSPACE", "J", "\n")
@@ -145,8 +147,8 @@ class T(unittest.TestCase):
         run("b")                                   # no review issues on this commit: ignored
         run("j", "b", "y")
         run("r", "o", "k", "\n")                  # a board task with no queued decision: r sends guidance
-        run("j", "r", "好", "\n")                 # a tracked session: r sends your words unchanged
-        run("k", "k", "k", "r", "x", "\n")        # the session that is gone: r does nothing
+        run("j", "j", "r", "好", "\n")            # a tracked session: r sends your words unchanged
+        run("k", "r", "x", "\n")                  # the session that is gone: r does nothing
         self.assertEqual(calls, [("accept", "shop-demo:1"), ("reply", "shop-demo:1", "use J"),
                                  ("dismiss", "shop-demo:1", ""), ("nudge", "shop-demo", "go", False),
                                  ("close", "shop-demo"), ("nudge", "review-zh", None, True),
