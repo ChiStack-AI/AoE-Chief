@@ -183,17 +183,39 @@ chief inbox                      # check in whenever you like (or: chief brief)
 
 ```text
  AoE Chief · 1 needs you · 1 to confirm · 1 to accept · 4 tracked          last tick 2m ago · 14:05
+ Delegated tasks
  [!] csv import            3f7b88ca  codex   idle      12m ago  protected files changed: tests/test_io.py
  [?] shop demo             f29dfc6f  codex   idle       3m ago  chief drafted decision shop-demo:1: A) plain text
  [+] parser fix            62f82720  claude  idle      40m ago  all checks pass (3/3), ready for you to accept
+ Thinking sessions
  [ ] explore               9a1c03de  claude  running    0m ago
 ── shop demo ───────────────────────────────────────────────────────────────────────────────────────
  Decision shop-demo:1 (small, by rules)
  Q: Should receipt() return plain text lines or JSON? Recommendation: A) plain text
  Chief's draft: A) plain text
  ...
- a accept  r reply  d dismiss  n nudge  c close  o open  t tick  g refresh  q quit  ↑↓ move
+ N new task  a accept  r reply  d dismiss  n nudge  c close  o open  t tick  g refresh  q quit  ↑↓ move
 ```
+
+Press `N` to delegate a task in one line, even when the inbox is empty. The selected repository is shown above
+the input: it defaults to the selected item's source repository, or the current repository when none is available.
+Linked worktrees and repository subdirectories resolve to the original repository. `Tab` cycles a deterministic,
+deduplicated list of repositories from board tasks (including unstarted tasks), tracked sessions and the current
+repository. Type the intent and press `Enter` to draft a contract in the background.
+
+The contract appears in the detail pane. `Enter` creates and starts one task through the same lifecycle as
+`chief new`; the default is to write and commit acceptance tests, then wait for your explicit approval before
+implementation. Press `e` to edit the contract JSON in `$EDITOR` (default `vi`); the editor's arguments are supported.
+Chief validates the result, restores the terminal and returns to the preview before starting anything. Invalid edits
+or editor failures keep the last valid contract. `Esc` cancels input, a pending draft or a preview without creating a
+task, branch, worktree or session; late draft results are discarded. PgUp/PgDn scroll long contracts.
+
+Drafting and startup run in the background, and repeated submissions are ignored. Failures appear in the inbox.
+After confirming startup, let it finish; if startup fails, use the reported task ID to inspect or resume it with
+`chief kickoff <task-id>` instead of submitting the same contract again.
+
+The list separates **Delegated tasks** from tracked **Thinking sessions**, with urgent items first within each
+group. Arrow keys or j/k move between items and skip headings; refreshes retain the selected session.
 
 The footer shows only the keys that apply to the selected item: `a` accept Chief's draft, `r` reply (to the pending
 decision if there is one, otherwise straight to the session: guidance for a board task, your words unchanged for a
@@ -331,7 +353,7 @@ $AOE_CHIEF_HOME/
 - [x] **Intent tasks:** `chief new "<one sentence>"` with drafted contracts, and a test-first approval phase
 - [x] **Secret masking** at ingestion
 - [x] A test suite in the repository (`python3 -m unittest discover -s tests`)
-- [ ] Inbox: `N` to delegate a task in one line, and separate groups for delegated and thinking work
+- [x] Inbox: `N` to delegate a task in one line, and separate groups for delegated and thinking work
 - [ ] Recognise Claude's newer trust prompt
 
 The design rationale is in [docs/architecture.md](docs/architecture.md).

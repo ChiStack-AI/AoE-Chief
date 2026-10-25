@@ -587,6 +587,29 @@ def new_task_id(name):
         tid, n = "{}-{}".format(base, n), n+1
     return tid
 
+def prepare_new_task(contract, tid=None, trust=False):
+    """Apply `new` defaults and check identity without saving or creating git/session artifacts."""
+    t = dict(contract)
+    for key in ("repo", "name", "goal"):
+        if not t.get(key):
+            raise RuntimeError(L("a new task needs --{}", "立项需要 --{}").format(key))
+    t["repo"] = call(["git", "-C", os.path.expanduser(t["repo"]), "rev-parse", "--show-toplevel"], timeout=8).strip()
+    t.setdefault("test_first", True)
+    t["phase"] = "test" if t["test_first"] else "build"
+    t["id"] = tid or t.get("id") or new_task_id(t["name"])
+    if (TASKS/t["id"]).exists():
+        raise RuntimeError(L("task {} already exists", "任务 {} 已存在").format(t["id"]))
+    t.setdefault("tool", "codex")
+    t.setdefault("branch", "chief/" + t["id"])
+    t.setdefault("autonomy", "suggest")
+    t.update(state="draft", created_at=now_utc().isoformat(), trust=bool(trust))
+    return t
+
+def create_task(cfg, prepared, draft=False):
+    """Persist a prepared contract and use the standard worktree/session/kickoff lifecycle."""
+    save_task(prepared)
+    return prepared if draft else start_task(cfg, prepared, prepared.get("trust", False))
+
 def repo_text(repo, name):
     try:
         return (Path(repo)/name).read_text(encoding="utf-8")
@@ -2072,39 +2095,25 @@ def main():
                 t = dict(intent_draft(cfg, t["repo"], args.intent.strip()), **t)
             if args.rounds or args.hours:
                 t["budget"] = dict(t.get("budget") or {}, **{k: v for k, v in (("rounds", args.rounds), ("hours", args.hours)) if v})
-            for k in ("repo", "name", "goal"):
-                if not t.get(k):
-                    raise RuntimeError(L("a new task needs --{}", "立项需要 --{}").format(k))
-            t["repo"] = call(["git", "-C", os.path.expanduser(t["repo"]), "rev-parse", "--show-toplevel"], timeout=8).strip()
-            t.setdefault("test_first", True)
-            t["phase"] = "test" if t["test_first"] else "build"
             if args.intent is not None and not args.dry_run:
+                t.setdefault("test_first", True)
+                t["phase"] = "test" if t["test_first"] else "build"
                 t = confirm_draft(t, args.yes)
                 if t is None:
                     return 0
-                t["repo"] = call(["git", "-C", os.path.expanduser(t["repo"]), "rev-parse", "--show-toplevel"], timeout=8).strip()
-                t.setdefault("test_first", True)
-                t["phase"] = "test" if t["test_first"] else "build"
+            t = prepare_new_task(t, args.tid, args.trust)
             if not t.get("checks"):
                 print(L("Note: no --check registered, so done can only be the agent's claim",
                         "提示：没有登记 --check，完成只能靠 Agent 自称"), file=sys.stderr)
-            t["id"] = args.tid or t.get("id") or new_task_id(t["name"])
-            if (TASKS/t["id"]).exists():
-                raise RuntimeError(L("task {} already exists", "任务 {} 已存在").format(t["id"]))
-            t.setdefault("tool", "codex")
-            t.setdefault("branch", "chief/" + t["id"])
-            t.setdefault("autonomy", "suggest")
-            t.update(state="draft", created_at=now_utc().isoformat(), trust=bool(args.trust))
             if args.dry_run:
                 print(json.dumps(t, ensure_ascii=False, indent=2))
                 print("\n---- " + " ".join(shlex.quote(arg) for arg in add_command(cfg, t, dry_run=True)))
                 print(L("\n---- kickoff prompt ----\n", "\n---- 开场指令 ----\n") + kickoff_prompt(t))
                 return 0
-            save_task(t)
+            t = create_task(cfg, t, draft=args.draft)
             if args.draft:
                 print(L("Saved draft {}; start it with: chief.py kickoff {}", "已保存草稿 {}；启动：chief.py kickoff {}").format(t["id"], t["id"]))
                 return 0
-            t = start_task(cfg, t, args.trust)
             print(L("Task {} · {} · session {} · worktree {}", "任务 {} · {} · 会话 {} · worktree {}").format(
                 t["id"], t["state"], t["session_id"][:8], t["worktree"]))
             if t.get("note"):

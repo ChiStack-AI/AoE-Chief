@@ -7,11 +7,14 @@ background thread, because confirming delivery to a worker can take tens of seco
 """
 import curses
 from datetime import datetime
+import json
 import locale
 import os
+from pathlib import Path
+import shlex
 import subprocess
 import sys
-import textwrap
+import tempfile
 import threading
 import time
 import unicodedata
@@ -67,6 +70,28 @@ def wrap(s, w, indent=""):
         lines.append(cur)
     return lines
 
+def fit_row(segs, w):
+    """Bound every segment as well as the whole row, including on very small terminals."""
+    out, remaining = [], w
+    for text, style in segs:
+        used = min(remaining, width(text))
+        if used:
+            out.append((fit(text, used), style))
+        remaining -= used
+    if remaining:
+        out.append((" " * remaining, "text"))
+    return out
+
+def source_repository(ch, path):
+    """Resolve subdirectories, aliases and linked worktrees to the original working repository."""
+    path = os.path.realpath(os.path.expanduser(path))
+    top = ch.call(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=8).strip()
+    worktrees = ch.call(["git", "-C", top, "worktree", "list", "--porcelain"], timeout=8)
+    first = worktrees.split("\n\n", 1)[0].splitlines()
+    # A bare main repository cannot be a new task's working repository.
+    original = first[0][len("worktree "):] if first and first[0].startswith("worktree ") and "bare" not in first else top
+    return os.path.realpath(original)
+
 # ---------- View model: collect() result → inbox entries ----------
 
 def entry(ch, x):
@@ -118,6 +143,8 @@ def entry(ch, x):
     elif log.get("last_reply"):
         detail.append(("text", L("Last reply: ", "最近回复：") + ch.clip(log["last_reply"], 600)))
     return {"sid": x["id"], "task": task.get("id") if is_task else None, "title": x.get("title") or x["id"],
+            "group": "tasks" if task.get("id") else "thinking",
+            "repo": task.get("repo") or x.get("path") or task.get("worktree") or "",
             "tool": x.get("tool") or "", "status": x.get("status") or "", "ago": ch.ago(log.get("last_ts")),
             "level": lv, "headline": sigs[0][1] if sigs else (ft.get("conclusion") or ""),
             "decision": dec, "draft": bool(dec and dec.get("draft")),
@@ -126,7 +153,7 @@ def entry(ch, x):
 
 def entries(ch, result):
     es = [entry(ch, x) for x in result.get("items", [])]
-    return sorted(es, key=lambda e: ORDER.index(e["level"]))
+    return sorted(es, key=lambda e: (e["group"] != "tasks", ORDER.index(e["level"])))
 
 def keys_for(ch, e):
     """The footer shows only the keys that do something for the selected entry."""
@@ -145,12 +172,13 @@ def keys_for(ch, e):
         k.append(L("c close", "c 验收"))
     if e:
         k.append(L("o open", "o 进入"))
-    return k + [L("t tick", "t tick"), L("g refresh", "g 刷新"), L("q quit", "q 退出")]
+    return [L("N new task", "N 新任务")] + k + [L("t tick", "t tick"), L("g refresh", "g 刷新"), L("q quit", "q 退出")]
 
 # ---------- Rendering: state → rows of (text, style) segments ----------
 
 def render(ch, st, w, h):
     L, es = ch.L, st.get("entries") or []
+    new = st.get("new_task")
     rows = []
     n = {lv: sum(1 for e in es if e["level"] == lv) for lv in ORDER}
     left = " " + L("AoE Chief · {} needs you · {} to confirm · {} to accept · {} tracked",
@@ -158,14 +186,28 @@ def render(ch, st, w, h):
         n["red"], n["draft"], n["green"], len(es))
     right = "{} · {} ".format(st.get("tick_note", ""), st.get("clock", ""))
     rows.append([(fit(left, max(0, w - width(right))), "header"), (fit(right, min(w, width(right))), "header")])
-    if not es:
+    if not es and not new and h >= 5:
         rows.append([(fit(" " + (st.get("empty") or L("Loading…", "加载中…")), w), "info")])
-    list_h = min(len(es), max(3, (h - 4) // 3)) if es else 0
-    sel = min(st.get("sel", 0), max(0, len(es) - 1))
-    top = min(max(0, sel - list_h + 1), max(0, len(es) - list_h))
-    top = min(top, sel)
-    for i in range(top, top + list_h):
+    list_h = min(max(0, h - 4), max(3, (h - 4) // 3)) if es else 0
+    sel = max(0, min(st.get("sel", 0), len(es) - 1))
+    top, used = sel, 2                  # reserve a heading and the selected item
+    while top > 0:
+        cost = 1 + (es[top - 1]["group"] != es[top]["group"])
+        if used + cost > list_h:
+            break
+        top, used = top - 1, used + cost
+    group, shown = None, 0
+    for i in range(top, len(es)):
         e = es[i]
+        if e["group"] != group:
+            if shown + 2 > list_h:
+                break
+            group = e["group"]
+            label = L("Delegated tasks", "委派任务") if group == "tasks" else L("Thinking sessions", "思考会话")
+            rows.append([(fit(" " + label, w), "head")])
+            shown += 1
+        if shown >= list_h:
+            break
         lead = " {} ".format(MARK[e["level"]])
         if w >= 90:                          # narrow terminals drop the metadata before the headline
             meta = " " + "  ".join((fit(e["sid"][:8], 8), fit(e["tool"], 6), fit(e["status"], 8), fit(e["ago"], 10))) + "  "
@@ -179,12 +221,21 @@ def render(ch, st, w, h):
         if i == sel:
             segs = [(t, "sel") for t, _ in segs]
         rows.append(segs)
+        shown += 1
     e = es[sel] if es else None
-    bar = "── " + fit(e["title"], max(0, w - 8)).rstrip() + " " if e else ""
+    title = L("New task contract", "新任务合同") if new else (e["title"] if e else "")
+    bar = "── " + fit(title, max(0, w - 8)).rstrip() + " " if title else ""
     rows.append([(fit(bar + "─" * max(0, w - width(bar)), w), "dim")])
     body_h = max(0, h - len(rows) - 2)
     body = []
-    for style, text in (e["detail"] if e else []):
+    detail = e["detail"] if e else []
+    if new:
+        detail = [("head", L("Repository: ", "仓库：") + new["repo"])]
+        if new.get("contract"):
+            detail.append(("text", json.dumps(new["contract"], ensure_ascii=False, indent=2)))
+        else:
+            detail.append(("text", L("Task intent: ", "任务意图：") + new.get("intent", "")))
+    for style, text in detail:
         for line in wrap(text, max(10, w - 2), " "):
             body.append((style, line))
     scroll = min(st.get("scroll", 0), max(0, len(body) - body_h))
@@ -195,17 +246,33 @@ def render(ch, st, w, h):
         rows.append([(" " * w, "text")])
     if st.get("input") is not None:
         prompt = st["input"]["prompt"]
-        rows.append([(prompt, "prompt"), (fit(st["input"]["buf"], max(0, w - width(prompt))), "text")])
+        pw = min(width(prompt), w // 2)
+        buf, cells = "", 0
+        for c in reversed(st["input"]["buf"]):
+            if cells + cell(c) > w - pw:
+                break
+            buf, cells = c + buf, cells + cell(c)
+        rows.append([(fit(prompt, pw), "prompt"), (fit(buf, w - pw), "text")])
     elif st.get("confirm"):
         rows.append([(fit(st["confirm"]["prompt"], w), "prompt")])
     else:
         msg = st.get("msg", "")
         if st.get("busy"):
-            msg = "{} {}… ({}s)".format("-\\|/"[int(st.get("now", 0)) % 4], st["busy"], int(st.get("now", 0) - st.get("busy_since", 0)))
+            msg = "{} {}… ({}s)".format("-\\|/"[int(st.get("now", 0)) % 4], st["busy"], max(0, int(st.get("now", 0) - st.get("busy_since", 0))))
         rows.append([(fit(" " + msg, w), "msg")])
     more = L(" PgUp/PgDn scroll", " PgUp/PgDn 滚动") if len(body) > body_h else ""
-    rows.append([(fit(" " + "  ".join(keys_for(ch, e)) + L("  ↑↓ move", "  ↑↓ 选择") + more, w), "footer")])
-    return rows[:h]
+    keys = "  ".join(keys_for(ch, e)) + L("  ↑↓ move", "  ↑↓ 选择")
+    if new:
+        if new["phase"] == "intent":
+            keys = L("Enter draft  Tab repository  Esc cancel", "Enter 起草  Tab 切换仓库  Esc 取消")
+        elif new["phase"] == "preview":
+            keys = L("Enter create & start  e edit  Esc cancel", "Enter 创建并启动  e 编辑  Esc 取消")
+        elif new["phase"] == "drafting":
+            keys = L("Esc cancel", "Esc 取消")
+        else:
+            keys = L("Starting task…", "正在启动任务…")
+    rows.append([(fit(" " + keys + more, w), "footer")])
+    return [fit_row(row, w) for row in rows[:h]]
 
 # ---------- The app ----------
 
@@ -215,12 +282,14 @@ class Inbox:
         self.st = {"entries": [], "sel": 0, "scroll": 0, "msg": "", "busy": None, "input": None, "confirm": None}
         self.last_refresh = 0
         self.lock = threading.Lock()
+        self.current_repo = os.path.realpath(os.getcwd())
+        self.repositories = [self.current_repo]
 
     # Background work: one job at a time; every job ends with a refresh.
     def job(self, label, fn, refresh=True):
         if not self.lock.acquire(blocking=False):
             self.st["msg"] = self.ch.L("busy: {}", "忙：{}").format(self.st.get("busy"))
-            return
+            return False
         self.st.update(busy=label, busy_since=time.time())
 
         def go():
@@ -235,17 +304,46 @@ class Inbox:
             finally:
                 self.st["busy"] = None
                 self.lock.release()
-        threading.Thread(target=go, daemon=True).start()
+        try:
+            threading.Thread(target=go, daemon=True).start()
+        except Exception as exc:
+            self.st.update(busy=None, msg=self.ch.L("failed: ", "失败：") + self.ch.clip(str(exc), 300))
+            self.lock.release()
+            return False
+        return True
 
     def _refresh(self):
         res = self.ch.collect(self.cfg, checks=False, persist=False)
         es = entries(self.ch, res)
+        cache = {}
+
+        def resolve(path):
+            if not path:
+                return None
+            path = os.path.realpath(os.path.expanduser(path))
+            if path not in cache:
+                try:
+                    cache[path] = source_repository(self.ch, path) if os.path.isdir(path) else None
+                except (RuntimeError, OSError):
+                    cache[path] = None
+            return cache[path]
+
+        current = resolve(os.getcwd()) or os.path.realpath(os.getcwd())
+        repos = {current}
+        for e in es:
+            e["repo"] = resolve(e["repo"]) or current
+            repos.add(e["repo"])
+        for task in self.ch.all_tasks():
+            repo = resolve(task.get("repo") or task.get("worktree"))
+            if repo:
+                repos.add(repo)
+        self.current_repo, self.repositories = current, sorted(repos)
         cur = self.selected()
-        self.st["entries"] = es
+        sel = min(max(0, self.st["sel"]), max(0, len(es) - 1))
         if cur:                              # keep the selection on the same session when the order changes
-            self.st["sel"] = next((i for i, e in enumerate(es) if e["sid"] == cur["sid"]), self.st["sel"])
-        self.st["empty"] = self.ch.L("Nothing tracked yet: chief.py new … or chief.py track <ID>",
-                                     "还没有跟踪任何会话：chief.py new … 或 chief.py track <ID>")
+            sel = next((i for i, e in enumerate(es) if e["sid"] == cur["sid"]), sel)
+        self.st.update(entries=es, sel=sel, empty=self.ch.L("Nothing tracked yet: N to delegate, or chief.py track <ID>",
+                                                         "还没有跟踪任何会话：按 N 委派任务，或 chief.py track <ID>"))
         self.last_refresh = time.time()
 
     def refresh(self):
@@ -253,7 +351,7 @@ class Inbox:
 
     def selected(self):
         es = self.st["entries"]
-        return es[min(self.st["sel"], len(es) - 1)] if es else None
+        return es[max(0, min(self.st["sel"], len(es) - 1))] if es else None
 
     def tick_note(self):
         L = self.ch.L
@@ -279,11 +377,119 @@ class Inbox:
     def task(self, e):
         return self.ch.load_task(e["task"])
 
+    def new_intent(self):
+        e = self.selected()
+        repo = (e or {}).get("repo") or self.current_repo
+        repos = sorted(set(self.repositories + [repo]))
+        new = {"phase": "intent", "repo": repo, "repos": repos, "index": repos.index(repo)}
+        self.st.update(new_task=new, scroll=0, msg="")
+        self.ask(self.ch.L("Task intent: ", "任务意图："), lambda text: self.draft_intent(new, text))
+
+    def cancel_new(self):
+        # The in-flight draft may finish later; identity checks discard its result.
+        self.st.update(new_task=None, input=None, scroll=0, msg=self.ch.L("cancelled", "已取消"))
+
+    def draft_intent(self, new, text):
+        ch = self.ch
+        new.update(phase="drafting", intent=text)
+
+        def draft():
+            try:
+                contract = ch.validate_draft(ch.intent_draft(self.cfg, new["repo"], text))
+                contract.setdefault("test_first", True)
+                contract["phase"] = "test" if contract["test_first"] else "build"
+            except Exception:
+                if self.st.get("new_task") is not new:
+                    return None
+                self.st["new_task"] = None
+                raise
+            if self.st.get("new_task") is new:
+                new.update(phase="preview", contract=contract)
+                self.st.update(scroll=0, msg=ch.L("Review the contract before starting", "启动前请检查合同"))
+            return None
+
+        if not self.job(ch.L("drafting task", "起草任务中"), draft, refresh=False):
+            new["phase"] = "intent"
+            self.ask(ch.L("Task intent: ", "任务意图："), lambda value: self.draft_intent(new, value))
+            self.st["input"]["buf"] = text
+
+    def submit_new(self, new):
+        # Consume confirmation before any background work. Neither an extra Enter
+        # nor a launch failure can reuse this preview to create another task.
+        new["phase"] = "starting"
+
+        def start():
+            task = None
+            try:
+                task = self.ch.prepare_new_task(self.ch.validate_draft(new["contract"]))
+                task = self.ch.create_task(self.cfg, task)
+                return self.ch.L("Started task {}", "已启动任务 {}").format(task["id"]) + (
+                    ": " + task["note"] if task.get("note") else "")
+            except Exception as exc:
+                if task:
+                    raise RuntimeError(self.ch.L("Task {}: ", "任务 {}：").format(task["id"]) + str(exc)) from exc
+                raise
+            finally:
+                self.st["new_task"] = None
+
+        if not self.job(self.ch.L("starting task", "启动任务中"), start):
+            new["phase"] = "preview"
+
+    def edit_contract(self, scr):
+        """Suspend curses on its owning thread and keep the last valid preview on every failure."""
+        new = self.st.get("new_task")
+        if not new or new["phase"] != "preview" or self.st["busy"]:
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="chief-contract-") as folder:
+                path = Path(folder) / "contract.json"
+                path.write_text(json.dumps(new["contract"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                editor = shlex.split(os.environ.get("EDITOR") or "vi")
+                curses.def_prog_mode()
+                try:
+                    curses.endwin()
+                    status = subprocess.call(editor + [str(path)])
+                finally:
+                    curses.reset_prog_mode()
+                    scr.clear()
+                    try:
+                        curses.flushinp()
+                    except curses.error:
+                        pass
+                if status:
+                    raise ValueError(self.ch.L("editor exited unsuccessfully", "编辑器异常退出"))
+                contract = self.ch.validate_draft(json.loads(path.read_text(encoding="utf-8")))
+                contract["repo"] = source_repository(self.ch, contract["repo"])
+                contract.setdefault("test_first", True)
+                contract["phase"] = "test" if contract["test_first"] else "build"
+                new.update(contract=contract, repo=contract["repo"])
+                self.st.update(scroll=0, msg=self.ch.L("Contract updated; Enter creates the task", "合同已更新；Enter 创建任务"))
+        except (Exception, KeyboardInterrupt) as exc:
+            self.st["msg"] = self.ch.L("Could not edit the draft: ", "无法编辑草稿：") + self.ch.clip(str(exc), 300)
+
     def key(self, k):
         ch, L, e = self.ch, self.ch.L, self.selected()
         es = self.st["entries"]
+        new = self.st.get("new_task")
+        if k == "N":
+            if not new and not self.st["busy"]:
+                self.new_intent()
+            return True
+        if new:
+            if k == "\x1b" and new["phase"] != "starting":
+                self.cancel_new()
+            elif new["phase"] == "preview" and not self.st["busy"]:
+                if k in ("\n", "\r", "KEY_ENTER"):
+                    self.submit_new(new)
+                elif k == "e":
+                    return "edit"
+            if k == "q" and new["phase"] != "starting":
+                self.cancel_new()
+                return False
+            if k not in ("KEY_DOWN", "j", "KEY_UP", "k", "KEY_NPAGE", " ", "KEY_PPAGE"):
+                return True
         if k in ("KEY_DOWN", "j"):
-            self.st.update(sel=min(len(es) - 1, self.st["sel"] + 1), scroll=0)
+            self.st.update(sel=max(0, min(len(es) - 1, self.st["sel"] + 1)), scroll=0)
         elif k in ("KEY_UP", "k"):
             self.st.update(sel=max(0, self.st["sel"] - 1), scroll=0)
         elif k in ("KEY_NPAGE", " "):
@@ -346,14 +552,25 @@ class Inbox:
 
     def typed(self, k):
         inp = self.st["input"]
+        new = self.st.get("new_task")
+        if k == "\t" and new and new["phase"] == "intent":
+            new["index"] = (new["index"] + 1) % len(new["repos"])
+            new["repo"] = new["repos"][new["index"]]
+            self.st["scroll"] = 0
+            return
         if k in ("\n", "\r", "KEY_ENTER"):
-            self.st["input"] = None
             text = inp["buf"].strip()
+            if not text and new and new["phase"] == "intent":
+                return
+            self.st["input"] = None
             if text or inp["empty"]:
                 inp["then"](text)
         elif k == "\x1b":
-            self.st["input"] = None
-            self.st["msg"] = self.ch.L("cancelled", "已取消")
+            if new:
+                self.cancel_new()
+            else:
+                self.st["input"] = None
+                self.st["msg"] = self.ch.L("cancelled", "已取消")
         elif k in ("KEY_BACKSPACE", "\x7f", "\b"):
             inp["buf"] = inp["buf"][:-1]
         elif k == "\x15":                    # Ctrl-U clears the line
@@ -390,7 +607,8 @@ class Inbox:
         self.refresh()
         while True:
             now = time.time()
-            if now - self.last_refresh > self.every and not self.st["busy"] and not self.st["input"] and not self.st["confirm"]:
+            if (now - self.last_refresh > self.every and not self.st["busy"] and not self.st["input"]
+                    and not self.st["confirm"] and not self.st.get("new_task")):
                 self.refresh()
             self.st.update(now=now, clock=datetime.now().strftime("%H:%M"), tick_note=self.tick_note())
             h, w = scr.getmaxyx()
@@ -412,6 +630,8 @@ class Inbox:
                     return 0
                 if r == "open":
                     self.open_session(scr, self.selected())
+                elif r == "edit":
+                    self.edit_contract(scr)
 
 def setup_colors():
     s = {"text": curses.A_NORMAL, "title": curses.A_BOLD, "dim": curses.A_DIM, "info": curses.A_DIM,
