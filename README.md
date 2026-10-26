@@ -197,11 +197,22 @@ chief inbox                      # check in whenever you like (or: chief brief)
  N new task  a accept  r reply  d dismiss  n nudge  c close  o open  t tick  g refresh  q quit  ↑↓ move
 ```
 
-Press `N` to delegate a task in one line, even when the inbox is empty. The selected repository is shown above
-the input: it defaults to the selected item's source repository, or the current repository when none is available.
-Linked worktrees and repository subdirectories resolve to the original repository. `Tab` cycles a deterministic,
-deduplicated list of repositories from board tasks (including unstarted tasks), tracked sessions and the current
-repository. Type the intent and press `Enter` to draft a contract in the background.
+Press `N` to delegate a task, even when the inbox is empty. The first editable line holds the task intent and the
+second holds the repository path. Up/Down (`↑`/`↓`) switches the active line, marked with `>`, keeping both buffers.
+The repository defaults to the selected item's source repository, or the current repository when none is available.
+Subdirectories, symlinks and linked worktrees resolve to the original source repository.
+
+On the intent line, `Tab` cycles a deterministic, deduplicated list of repositories from board tasks (including
+unstarted tasks), tracked sessions and the current repository. On the repository line, `Tab` completes directory
+paths: absolute, relative and `~/` paths are supported, with spaces and quotes kept literally. A unique directory
+match gains a trailing slash; ambiguous matches extend to their longest common prefix. When the repository line
+is empty, repeated `Tab` cycles the same known repositories. Typing or clearing the path returns to path completion.
+
+Repository edits validate live in the background. The composer shows a pending or invalid state, or the resolved
+Git toplevel when valid. `Enter` from either line drafts a contract only with a nonblank intent and a valid
+repository; the repository is checked again before drafting. Invalid input stays editable and creates no artifacts.
+`Ctrl-U` clears the active line and Backspace edits it. Queued paste input is processed in batches, preserving
+characters and order while keeping the UI responsive, without a redraw or Git validation for every character.
 
 The contract appears in the detail pane. `Enter` creates and starts one task through the same lifecycle as
 `chief new`; the default is to write and commit acceptance tests, then wait for your explicit approval before

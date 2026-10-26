@@ -11,6 +11,7 @@ import json
 import locale
 import os
 from pathlib import Path
+import queue
 import shlex
 import subprocess
 import sys
@@ -91,6 +92,21 @@ def source_repository(ch, path):
     # A bare main repository cannot be a new task's working repository.
     original = first[0][len("worktree "):] if first and first[0].startswith("worktree ") and "bare" not in first else top
     return os.path.realpath(original)
+
+def complete_directory(path):
+    """Complete one literal directory path, retaining its relative or ~/ spelling."""
+    if path == "~" and os.path.isdir(os.path.expanduser(path)):
+        return "~/"
+    parent, prefix = os.path.split(path)
+    try:
+        with os.scandir(os.path.expanduser(parent or ".")) as directory:
+            matches = [entry.name for entry in directory if entry.name.startswith(prefix) and entry.is_dir()]
+    except OSError:
+        return path
+    if not matches:
+        return path
+    completed = os.path.join(parent, os.path.commonprefix(matches))
+    return completed + "/" if len(matches) == 1 else completed
 
 # ---------- View model: collect() result → inbox entries ----------
 
@@ -176,9 +192,20 @@ def keys_for(ch, e):
 
 # ---------- Rendering: state → rows of (text, style) segments ----------
 
+def input_row(prompt, buf, w, active=True):
+    pw = min(width(prompt), w // 2)
+    tail, cells = "", 0
+    for c in reversed(buf):
+        if cells + cell(c) > w - pw:
+            break
+        tail, cells = c + tail, cells + cell(c)
+    return [(fit(prompt, pw), "prompt" if active else "dim"),
+            (fit(tail, w - pw), "text" if active else "dim")]
+
 def render(ch, st, w, h):
     L, es = ch.L, st.get("entries") or []
     new = st.get("new_task")
+    composing = new and new["phase"] == "intent"
     rows = []
     n = {lv: sum(1 for e in es if e["level"] == lv) for lv in ORDER}
     left = " " + L("AoE Chief · {} needs you · {} to confirm · {} to accept · {} tracked",
@@ -226,11 +253,20 @@ def render(ch, st, w, h):
     title = L("New task contract", "新任务合同") if new else (e["title"] if e else "")
     bar = "── " + fit(title, max(0, w - 8)).rstrip() + " " if title else ""
     rows.append([(fit(bar + "─" * max(0, w - width(bar)), w), "dim")])
-    body_h = max(0, h - len(rows) - 2)
+    bottom_h = 3 if composing else 2
+    body_h = max(0, h - len(rows) - bottom_h)
     body = []
     detail = e["detail"] if e else []
-    if new:
-        detail = [("head", L("Repository: ", "仓库：") + new["repo"])]
+    if composing:
+        status = new["repo_status"]
+        if status == "valid":
+            detail = [("green", L("Resolved Git toplevel: ", "Git 源仓库：") + new["resolved_repo"])]
+        elif status == "invalid":
+            detail = [("red", L("Invalid repository: ", "仓库无效：") + new["repo_error"])]
+        else:
+            detail = [("yellow", L("Checking repository…", "正在检查仓库…"))]
+    elif new:
+        detail = [("head", L("Repository: ", "仓库：") + (new.get("resolved_repo") or new["repo"]))]
         if new.get("contract"):
             detail.append(("text", json.dumps(new["contract"], ensure_ascii=False, indent=2)))
         else:
@@ -242,17 +278,14 @@ def render(ch, st, w, h):
     st["scroll"] = scroll
     for style, line in body[scroll:scroll + body_h]:
         rows.append([(fit(line, w), style)])
-    while len(rows) < h - 2:
+    while len(rows) < h - bottom_h:
         rows.append([(" " * w, "text")])
-    if st.get("input") is not None:
-        prompt = st["input"]["prompt"]
-        pw = min(width(prompt), w // 2)
-        buf, cells = "", 0
-        for c in reversed(st["input"]["buf"]):
-            if cells + cell(c) > w - pw:
-                break
-            buf, cells = c + buf, cells + cell(c)
-        rows.append([(fit(prompt, pw), "prompt"), (fit(buf, w - pw), "text")])
+    if composing:
+        for field, prompt in (("intent", L("Task intent: ", "任务意图：")), ("repo", L("Repository: ", "仓库："))):
+            active = new["active"] == field
+            rows.append(input_row(("> " if active else "  ") + prompt, new[field], w, active))
+    elif st.get("input") is not None:
+        rows.append(input_row(st["input"]["prompt"], st["input"]["buf"], w))
     elif st.get("confirm"):
         rows.append([(fit(st["confirm"]["prompt"], w), "prompt")])
     else:
@@ -264,7 +297,9 @@ def render(ch, st, w, h):
     keys = "  ".join(keys_for(ch, e)) + L("  ↑↓ move", "  ↑↓ 选择")
     if new:
         if new["phase"] == "intent":
-            keys = L("Enter draft  Tab repository  Esc cancel", "Enter 起草  Tab 切换仓库  Esc 取消")
+            keys = (L("↑↓ line  Enter draft  Tab complete path  Esc cancel", "↑↓ 切换行  Enter 起草  Tab 补全路径  Esc 取消")
+                    if new["active"] == "repo" else
+                    L("↑↓ line  Enter draft  Tab repository  Esc cancel", "↑↓ 切换行  Enter 起草  Tab 切换仓库  Esc 取消"))
         elif new["phase"] == "preview":
             keys = L("Enter create & start  e edit  Esc cancel", "Enter 创建并启动  e 编辑  Esc 取消")
         elif new["phase"] == "drafting":
@@ -284,6 +319,9 @@ class Inbox:
         self.lock = threading.Lock()
         self.current_repo = os.path.realpath(os.getcwd())
         self.repositories = [self.current_repo]
+        self.valid_repositories = set()
+        self.validation_results = queue.Queue()
+        self.validation_thread = None
 
     # Background work: one job at a time; every job ends with a refresh.
     def job(self, label, fn, refresh=True):
@@ -338,6 +376,7 @@ class Inbox:
             if repo:
                 repos.add(repo)
         self.current_repo, self.repositories = current, sorted(repos)
+        self.valid_repositories = {repo for repo in cache.values() if repo}
         cur = self.selected()
         sel = min(max(0, self.st["sel"]), max(0, len(es) - 1))
         if cur:                              # keep the selection on the same session when the order changes
@@ -381,9 +420,69 @@ class Inbox:
         e = self.selected()
         repo = (e or {}).get("repo") or self.current_repo
         repos = sorted(set(self.repositories + [repo]))
-        new = {"phase": "intent", "repo": repo, "repos": repos, "index": repos.index(repo)}
+        new = {"phase": "intent", "repo": repo, "intent": "", "active": "intent", "repos": repos,
+               "index": repos.index(repo), "repo_cycle": False, "repo_version": 0}
         self.st.update(new_task=new, scroll=0, msg="")
-        self.ask(self.ch.L("Task intent: ", "任务意图："), lambda text: self.draft_intent(new, text))
+        self.repository_changed(new, known=True)
+        self.composer_input(new)
+
+    def composer_input(self, new):
+        prompt = (self.ch.L("Task intent: ", "任务意图：") if new["active"] == "intent" else
+                  self.ch.L("Repository: ", "仓库："))
+        self.ask(prompt, lambda text: self.draft_intent(new, text))
+        self.st["input"]["buf"] = new[new["active"]]
+
+    def repository_changed(self, new, known=False):
+        """Invalidate immediately; coalesce subsequent edits before doing Git I/O."""
+        new.update(repo_version=new["repo_version"] + 1, resolved_repo=None, repo_error="",
+                   repo_status="pending", validate_after=time.monotonic() + 0.12)
+        if not new["repo"]:
+            new.update(repo_status="invalid", repo_error=self.ch.L("Repository is empty", "仓库路径为空"))
+        elif known and new["repo"] in self.valid_repositories:
+            new.update(repo_status="valid", resolved_repo=new["repo"])
+
+    def resolve_repository(self, path):
+        if not path or not os.path.isdir(os.path.expanduser(path)):
+            raise ValueError(self.ch.L("Not a directory", "不是目录"))
+        return source_repository(self.ch, path)
+
+    def validate_repository(self):
+        """Apply background results on the UI thread, discarding obsolete edits."""
+        while True:
+            try:
+                new, version, resolved, error = self.validation_results.get_nowait()
+            except queue.Empty:
+                break
+            if (self.st.get("new_task") is new and new["phase"] == "intent"
+                    and new["repo_version"] == version):
+                new.update(repo_status="invalid" if error else "valid", resolved_repo=resolved, repo_error=error)
+        new = self.st.get("new_task")
+        if (not new or new["phase"] != "intent" or new["repo_status"] != "pending"
+                or time.monotonic() < new["validate_after"]
+                or (self.validation_thread and self.validation_thread.is_alive())):
+            return
+        version, path = new["repo_version"], new["repo"]
+
+        def validate():
+            try:
+                resolved, error = self.resolve_repository(path), ""
+            except Exception as exc:
+                resolved, error = None, self.ch.clip(str(exc) or type(exc).__name__, 240)
+            self.validation_results.put((new, version, resolved, error))
+
+        try:
+            self.validation_thread = threading.Thread(target=validate, daemon=True)
+            self.validation_thread.start()
+        except Exception as exc:
+            new.update(repo_status="invalid", repo_error=self.ch.clip(str(exc) or type(exc).__name__, 240))
+
+    def cycle_repository(self, new):
+        new["index"] = (new["index"] + 1) % len(new["repos"])
+        new["repo"] = new["repos"][new["index"]]
+        self.repository_changed(new, known=True)
+        if new["active"] == "repo":
+            self.st["input"]["buf"] = new["repo"]
+        self.st["scroll"] = 0
 
     def cancel_new(self):
         # The in-flight draft may finish later; identity checks discard its result.
@@ -391,11 +490,24 @@ class Inbox:
 
     def draft_intent(self, new, text):
         ch = self.ch
+        path, intent_buffer = new["repo"], new["intent"]
         new.update(phase="drafting", intent=text)
 
         def draft():
+            # A live validation result can become stale before Enter (for
+            # example, the .git directory was moved). Check again before AI.
             try:
-                contract = ch.validate_draft(ch.intent_draft(self.cfg, new["repo"], text))
+                repo = self.resolve_repository(path)
+            except Exception as exc:
+                if self.st.get("new_task") is new:
+                    new.update(phase="intent", intent=intent_buffer, repo_status="invalid", resolved_repo=None,
+                               repo_error=ch.clip(str(exc) or type(exc).__name__, 240))
+                    self.composer_input(new)
+                return None
+            if self.st.get("new_task") is new:
+                new["resolved_repo"] = repo
+            try:
+                contract = ch.validate_draft(ch.intent_draft(self.cfg, repo, text))
                 contract.setdefault("test_first", True)
                 contract["phase"] = "test" if contract["test_first"] else "build"
             except Exception:
@@ -409,9 +521,8 @@ class Inbox:
             return None
 
         if not self.job(ch.L("drafting task", "起草任务中"), draft, refresh=False):
-            new["phase"] = "intent"
-            self.ask(ch.L("Task intent: ", "任务意图："), lambda value: self.draft_intent(new, value))
-            self.st["input"]["buf"] = text
+            new.update(phase="intent", intent=intent_buffer)
+            self.composer_input(new)
 
     def submit_new(self, new):
         # Consume confirmation before any background work. Neither an extra Enter
@@ -553,15 +664,33 @@ class Inbox:
     def typed(self, k):
         inp = self.st["input"]
         new = self.st.get("new_task")
-        if k == "\t" and new and new["phase"] == "intent":
-            new["index"] = (new["index"] + 1) % len(new["repos"])
-            new["repo"] = new["repos"][new["index"]]
-            self.st["scroll"] = 0
-            return
+        if new and new["phase"] == "intent":
+            if k in ("KEY_UP", "KEY_DOWN"):
+                new["active"] = "intent" if k == "KEY_UP" else "repo"
+                self.composer_input(new)
+                return
+            if k == "\t":
+                if new["active"] == "intent":
+                    self.cycle_repository(new)
+                elif not new["repo"] or new["repo_cycle"]:
+                    new["repo_cycle"] = True
+                    self.cycle_repository(new)
+                else:
+                    completed = complete_directory(new["repo"])
+                    if completed != new["repo"]:
+                        new["repo"] = inp["buf"] = completed
+                        self.repository_changed(new)
+                return
+            if k in ("\n", "\r", "KEY_ENTER"):
+                self.validate_repository()
+                text = new["intent"].strip()
+                if text and new["repo_status"] == "valid" and not self.st["busy"]:
+                    self.st["input"] = None
+                    self.draft_intent(new, text)
+                return
+        previous = inp["buf"]
         if k in ("\n", "\r", "KEY_ENTER"):
             text = inp["buf"].strip()
-            if not text and new and new["phase"] == "intent":
-                return
             self.st["input"] = None
             if text or inp["empty"]:
                 inp["then"](text)
@@ -577,6 +706,11 @@ class Inbox:
             inp["buf"] = ""
         elif len(k) == 1 and k.isprintable():
             inp["buf"] += k
+        if new and self.st["input"] is inp and inp["buf"] != previous:
+            new[new["active"]] = inp["buf"]
+            if new["active"] == "repo":
+                new["repo_cycle"] = False
+                self.repository_changed(new)
 
     def answered(self, k):
         c, self.st["confirm"] = self.st["confirm"], None
@@ -606,6 +740,7 @@ class Inbox:
         scr.timeout(250)
         self.refresh()
         while True:
+            self.validate_repository()
             now = time.time()
             if (now - self.last_refresh > self.every and not self.st["busy"] and not self.st["input"]
                     and not self.st["confirm"] and not self.st.get("new_task")):
@@ -613,25 +748,43 @@ class Inbox:
             self.st.update(now=now, clock=datetime.now().strftime("%H:%M"), tick_note=self.tick_note())
             h, w = scr.getmaxyx()
             draw(scr, render(self.ch, self.st, w, h), styles, w, h)
+            new = self.st.get("new_task")
+            scr.timeout(50 if new and new["phase"] == "intent" and new["repo_status"] == "pending" else 250)
             try:
                 k = scr.get_wch()
             except curses.error:
                 continue
-            if k == curses.KEY_RESIZE:
-                continue
-            k = curses.keyname(k).decode() if isinstance(k, int) else k
-            if self.st["input"] is not None:
-                self.typed(k)
-            elif self.st["confirm"]:
-                self.answered(k)
-            else:
-                r = self.key(k)
-                if r is False:
-                    return 0
-                if r == "open":
-                    self.open_session(scr, self.selected())
-                elif r == "edit":
-                    self.edit_contract(scr)
+            # Dispatch before reading the next key: a paste can switch fields,
+            # cancel input or submit, and later keys must see that new state.
+            started = time.monotonic()
+            scr.timeout(0)
+            try:
+                for index in range(256):
+                    if k == curses.KEY_RESIZE:
+                        break
+                    k = curses.keyname(k).decode() if isinstance(k, int) else k
+                    if self.st["input"] is not None:
+                        self.typed(k)
+                    elif self.st["confirm"]:
+                        self.answered(k)
+                    else:
+                        r = self.key(k)
+                        if r is False:
+                            return 0
+                        if r == "open":
+                            self.open_session(scr, self.selected())
+                            break
+                        elif r == "edit":
+                            self.edit_contract(scr)
+                            break
+                    if k in ("\n", "\r", "KEY_ENTER") or index == 255 or time.monotonic() - started >= 0.008:
+                        break
+                    try:
+                        k = scr.get_wch()
+                    except curses.error:
+                        break
+            finally:
+                scr.timeout(250)
 
 def setup_colors():
     s = {"text": curses.A_NORMAL, "title": curses.A_BOLD, "dim": curses.A_DIM, "info": curses.A_DIM,
