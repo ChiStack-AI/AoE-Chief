@@ -168,6 +168,12 @@ approve the files. This is always a big decision with no Chief draft, including 
 Reply with feedback to keep revising the tests. Chief does not automatically continue or review work before
 this approval. Add `--no-test-first` to begin implementation immediately.
 
+During implementation, new test files under protected directories appear as **yellow** review items, with
+their paths listed. Chief compares against the task's scope base, including committed, staged and untracked
+additions. Existing protected files changed or deleted remain **red**, including the source of a rename.
+Explicitly approved test files and non-test protected files remain protected. The test phase still permits
+acceptance-test edits and additions under test directories.
+
 The existing flag-based form also works, without AI drafting or a contract confirmation prompt:
 
 ```bash
@@ -178,6 +184,41 @@ chief new --repo ~/workspace/myproj --name "parser fix" \
 chief watch --every 300          # or run it as a standing AoE session (see below)
 chief inbox                      # check in whenever you like (or: chief brief)
 ```
+
+### Closing and cleaning tasks
+
+`chief close <id>` marks a task done and runs `aoe session archive` to stop its process. The archived session
+record, worktree, branch and `.chief/progress.md` stay available. Add `--abandon` to mark it abandoned instead.
+`chief tasks` prints complete task IDs so similar long names remain distinguishable.
+
+```bash
+chief close parser-fix
+chief clean --dry-run             # preview closed tasks, skips and proposed branch actions
+chief clean                       # list candidates, then confirm with y (default: no)
+chief clean --branches            # also delete eligible merged branches with git branch -d
+chief close parser-fix --remove-session   # preserve progress and immediately trash session/worktree
+```
+
+Cleanup finds done and abandoned tasks with sessions in the configured AoE profile, including archived
+sessions. It lists each full task ID, name, branch, merge status and worktree dirtiness. A branch is merged
+when its commits are contained in the task's `base_branch`, or the repository's current `HEAD` if no base
+branch was set. Failed verification is shown as unknown.
+
+Before trashing, Chief copies an existing `<worktree>/.chief/progress.md` to
+`$AOE_CHIEF_HOME/tasks/<id>/progress.md`. Missing progress is allowed; a copy failure blocks that task's
+removal. Dirty worktrees and worktrees whose cleanliness cannot be verified are skipped. Tracked and
+untracked changes count, except `SCOPE_IGNORE` defaults and configured `scope_ignore` patterns. Chief
+rechecks cleanliness immediately before removal and reports individual failures while continuing with other
+candidates. Cancellation, EOF and an empty candidate list make no changes; `--dry-run` never prompts or writes.
+
+Branches stay by default. With `--branches`, only verified merged branches are deleted after successful
+session/worktree removal, using non-forced Git deletion. Unmerged, unknown and still checked-out branches
+stay. `close --remove-session` also keeps the branch; it refuses dirty worktrees unless you explicitly pass
+`--force`. That override does not bypass progress preservation. Sessions and worktrees go through AoE's
+trash mechanism; use `aoe session restore <session-id>` to restore a session.
+Chief verifies that AoE's `session.delete_to_trash` setting is enabled before invoking removal, and refuses
+to report cleanup success if the worktree remains in place or the persisted session has not entered trash.
+Ambiguous profile overrides are refused; use a plain boolean `session.delete_to_trash = true` declaration.
 
 ### 📥 The inbox
 
@@ -238,6 +279,10 @@ tracked session), `d` dismiss the decision, `n` send the worker guidance, `b` se
 background, so the inbox stays responsive. It refreshes every 15 seconds and never runs checks; `watch` does the
 driving.
 
+After `c` successfully closes and archives a task, a second `(y/N)` confirmation offers to clean that task's
+session and worktree. Enter, `n` or Esc keeps it archived. Accepting preserves progress, checks cleanliness
+again and keeps the branch. A cleanup failure leaves the task closed and shows how to inspect or retry it.
+
 To keep the inbox and the driver as standing sessions in AoE, register them as custom agents in
 `~/.config/agent-of-empires/config.toml`:
 
@@ -273,6 +318,7 @@ sessions and summarize them (`chief track <session>`), but it does not drive the
 | | `task <id> --goal --check ...` | Attach a goal and checks to a session you did not create with `new` |
 | | `check <id>` | Run a task's checks now |
 | 🗂️ Tasks | `new`, `tasks`, `kickoff`, `close [--abandon] [--remove-session]` | Task lifecycle |
+| | `clean [--dry-run] [--branches]` | Trash closed tasks' clean worktrees/sessions; keep branches by default |
 | 🔁 Drive | `tick [--dry-run]`, `watch --every SEC` | One round, or a loop, of automatic actions |
 | | `nudge <id> [TEXT] [--review]` | Send guidance or review issues back, and resume automation |
 | | `rotate <id>`, `review <id>` | Start a fresh session now; run a cross review now |
@@ -312,7 +358,7 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `engine` | `codex` | AI engine for briefs and decision drafts |
 | `models` | see `chief engine` | Model and effort overrides, per engine and level |
 | `check_timeout` | 300 | Seconds allowed per check command |
-| `scope_ignore` | `[]` | Extra patterns the scope check ignores |
+| `scope_ignore` | `[]` | Extra patterns the scope and cleanup cleanliness checks ignore |
 | `decision_ai` | `false` | Let AI re-judge and draft new decisions |
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
 | `review`, `review_engine`, `review_level` | `true`, the other engine, 2 | Cross review |
@@ -337,6 +383,7 @@ $AOE_CHIEF_HOME/
     decisions.json       the decision queue and its history
     events.jsonl         everything Chief did automatically
     review.md            the latest cross review card
+    progress.md          progress copied before session/worktree cleanup
 <worktree>/.chief/progress.md   the worker's handoff file (git-ignored locally)
 ```
 

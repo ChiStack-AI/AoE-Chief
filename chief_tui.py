@@ -328,6 +328,7 @@ class Inbox:
         self.valid_repositories = set()
         self.validation_results = queue.Queue()
         self.recheck_results = queue.Queue()
+        self.closed_tasks = queue.Queue()
         self.validation_thread = None
 
     # Background work: one job at a time; every job ends with a refresh.
@@ -414,6 +415,40 @@ class Inbox:
         L = self.ch.L
         return what + ("" if ok else L(", but delivery was not confirmed; press o to check", "，但没确认送达，按 o 进去看看"))
 
+    def close_entry(self, e):
+        task = self.ch.close_task(self.cfg, self.task(e))
+        if task.get("session_id") and not task.get("session_removed"):
+            self.closed_tasks.put((e["task"], task.get("branch", "?")))
+        message = self.ch.L("{} closed; branch {} kept", "{} 已完成；分支 {} 保留").format(e["task"], task.get("branch", "?"))
+        if task.get("session_archived") and not task.get("session_removed"):
+            message += self.ch.L("; session archived", "；会话已归档")
+        return message
+
+    def offer_cleanup(self):
+        """Offer completed background closes on the UI thread, retaining the task ID."""
+        if self.st["busy"] or self.st["input"] or self.st["confirm"] or self.st.get("new_task"):
+            return
+        try:
+            tid, branch = self.closed_tasks.get_nowait()
+        except queue.Empty:
+            return
+        ch, L = self.ch, self.ch.L
+
+        def cleanup():
+            try:
+                ch.clean_task(self.cfg, ch.load_task(tid))
+                return L("{} closed; session/worktree in AoE trash; branch {} kept",
+                         "{} 已完成；会话和 worktree 已移入 AoE 回收站；分支 {} 保留").format(tid, branch)
+            except (RuntimeError, OSError, ValueError) as exc:
+                return L("{} remains closed; cleanup failed: {}. Inspect the files/progress and retry `chief clean`.",
+                         "{} 仍为已完成；清理失败：{}。请检查文件和进度后运行 `chief clean` 重试。").format(tid, ch.clip(str(exc), 220))
+
+        self.confirm(L("Clean {}'s session/worktree now (preserve progress, keep branch)? (y/N)",
+                       "现在清理 {} 的会话和 worktree（保存进度、保留分支）？(y/N)").format(tid),
+                     lambda: self.job(L("cleaning", "清理中"), cleanup),
+                     declined=L("{} closed; session stays archived; worktree and branch {} kept",
+                                "{} 已完成；会话继续归档；worktree 和分支 {} 保留").format(tid, branch))
+
     def decision(self, e):
         d = self.ch.find_decision(e["decision"]["id"])
         if d["state"] != "pending":
@@ -455,6 +490,7 @@ class Inbox:
 
     def validate_repository(self):
         """Apply background results on the UI thread, discarding obsolete edits."""
+        self.offer_cleanup()
         while True:
             try:
                 new, version, resolved, error = self.validation_results.get_nowait()
@@ -664,10 +700,9 @@ class Inbox:
                          lambda: self.job(L("sending back", "退回中"),
                                           lambda: self.sent(ch.nudge(self.cfg, self.task(e), None, True), L("sent back", "已退回"))))
         elif k == "c" and e and e["task"]:
-            self.confirm(L("Close {} as done (session, worktree and branch stay)? (y/N)",
-                           "把 {} 标记为完成（会话、worktree、分支都保留）？(y/N)").format(e["task"]),
-                         lambda: self.job(L("closing", "验收中"), lambda: L("{} closed; branch {} kept", "{} 已完成；分支 {} 保留").format(
-                             e["task"], ch.close_task(self.cfg, self.task(e)).get("branch"))))
+            self.confirm(L("Close {} as done and archive/stop its session (keep worktree and branch)? (y/N)",
+                           "把 {} 标记为完成并归档、停止会话（保留 worktree 和分支）？(y/N)").format(e["task"]),
+                         lambda: self.job(L("closing", "验收中"), lambda: self.close_entry(e)))
         elif k == "o" and e:
             return "open"
         return True
@@ -675,8 +710,8 @@ class Inbox:
     def ask(self, prompt, then, allow_empty=False):
         self.st["input"] = {"prompt": prompt, "buf": "", "then": then, "empty": allow_empty}
 
-    def confirm(self, prompt, then):
-        self.st["confirm"] = {"prompt": prompt, "then": then}
+    def confirm(self, prompt, then, declined=None):
+        self.st["confirm"] = {"prompt": prompt, "then": then, "declined": declined}
 
     def typed(self, k):
         inp = self.st["input"]
@@ -737,7 +772,7 @@ class Inbox:
         if k in ("y", "Y"):
             c["then"]()
         else:
-            self.st["msg"] = self.ch.L("cancelled", "已取消")
+            self.st["msg"] = c.get("declined") or self.ch.L("cancelled", "已取消")
 
     def open_session(self, scr, e):
         """Inside tmux: switch to the agent's tmux session. Otherwise: attach with AoE, and come back on detach."""

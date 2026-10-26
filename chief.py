@@ -100,10 +100,14 @@ def redact(text):
 def safe_write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(value)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(value if isinstance(value, bytes) else value.encode("utf-8"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 def config():
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -138,7 +142,30 @@ def call(args, timeout=25, input_text=None, cwd=None):
     return p.stdout
 
 def aoe(cfg, *args):
-    return call([aoe_bin(), "-p", cfg["profile"], *args])
+    command = [aoe_bin(), "-p", cfg["profile"]]
+    if args and args[0] == "remove":
+        # Without trash enabled AoE's same `remove` command permanently tears
+        # down resources, including branches according to AoE configuration.
+        setting = call(command + ["settings", "explain", "session.delete_to_trash"])
+        if not re.search(r"(?m)^session\.delete_to_trash\s*=\s*true\s*$", setting):
+            raise RuntimeError(L("AoE trash is disabled or could not be verified; enable session.delete_to_trash before cleanup",
+                                 "AoE 回收站已禁用或无法验证；请启用 session.delete_to_trash 后再清理"))
+        # `settings explain` describes global values. A profile may disable
+        # trash separately. Python 3.7 has no TOML parser: conservatively refuse
+        # any mention that is not a plain true assignment, including ambiguous
+        # quoted/commented declarations. Decode escaped keys before checking.
+        profile_config = AOE_HOME/"profiles"/cfg["profile"]/"config.toml"
+        try:
+            overrides = profile_config.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            overrides = ""
+        overrides = re.sub(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))",
+                           lambda m: chr(int(m.group(1) or m.group(2), 16)), overrides)
+        for match in re.finditer(r"(?<![\w])delete_to_trash(?![\w])", overrides):
+            if not re.match(r"[\"']?\s*=\s*true(?=$|[\s,#}])", overrides[match.end():]):
+                raise RuntimeError(L("AoE profile trash override is disabled or unknown; enable session.delete_to_trash in {} before cleanup",
+                                     "AoE 配置空间的回收站覆盖值已禁用或未知；请在 {} 启用 session.delete_to_trash 后再清理").format(profile_config))
+    return call(command + list(args))
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -513,6 +540,12 @@ SCOPE_IGNORE = ["__pycache__", "*.pyc", ".pytest_cache", ".mypy_cache", ".ruff_c
 def ignored(rel, patterns):
     return any(fnmatch.fnmatch(part, p) for part in rel.split("/") for p in patterns)
 
+def is_test_file(path):
+    """Conventional test filenames; fixtures and configuration remain protected."""
+    name = Path(path).name
+    return bool(re.match(r"(?:test.*\.py|.*_test\.py|test_.*\.rb|.*_(?:test\.go|spec\.rb)|"
+                         r".*\.(?:test|spec)\.[cm]?[jt]sx?|(?:Test.*|.*Tests?)\.(?:java|kt))$", name))
+
 def scope_info(path, task, extra_ignore=()):
     """Scope/protection since base; acceptance tests may change during the test phase."""
     scope, protected = task.get("scope"), task.get("protected") or []
@@ -520,22 +553,53 @@ def scope_info(path, task, extra_ignore=()):
         return None
     try:
         top = call(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=8).strip()
-        names = call(["git", "-C", top, "diff", "--name-only", task.get("base") or "HEAD"], timeout=15).splitlines()
-        names += call(["git", "-C", top, "ls-files", "--others", "--exclude-standard"], timeout=15).splitlines()
-    except RuntimeError:
+        diff = call(["git", "-C", top, "diff", "--name-status", "-z", "--find-renames",
+                     task.get("base") or "HEAD", "--"], timeout=15)
+        # Include index-only changes even when an unstaged edit reverses them
+        # on disk; those staged contents can still be committed by the worker.
+        diff += call(["git", "-C", top, "diff", "--cached", "--name-status", "-z", "--find-renames",
+                      task.get("base") or "HEAD", "--"], timeout=15)
+        changes = {}
+        fields = iter(diff.rstrip("\0").split("\0") if diff else [])
+        for status in fields:
+            source = next(fields)
+            if status.startswith(("R", "C")):
+                destination = next(fields)
+                if status.startswith("R"):
+                    changes[source] = "D"  # protection follows the old path as well as the new one
+                changes[destination] = "A" if status.startswith("C") else "R"
+            else:
+                changes[source] = status[0]
+        untracked = call(["git", "-C", top, "ls-files", "-z", "--others", "--exclude-standard"], timeout=15)
+        for name in untracked.split("\0"):
+            if name:
+                changes.setdefault(name, "A")
+    except (RuntimeError, ValueError, StopIteration):
         return None
     pats = SCOPE_IGNORE + list(extra_ignore)
-    files = sorted({os.path.join(top, n) for n in names if n and not ignored(n, pats)})
+    files = {os.path.join(top, n): status for n, status in changes.items() if n and not ignored(n, pats)}
 
     def under(f, d):
         d = os.path.normpath(os.path.join(path, d))
         return f == d or f.startswith(d.rstrip("/") + "/")
     rel = lambda f: os.path.relpath(f, path)
     test_dirs = infer_protected(path) if in_test_phase(task) else []
+    explicit = {os.path.normpath(os.path.join(path, d)) for d in protected}
+    touched, additions, violations = [], [], []
+    for f in sorted(files):
+        if not any(under(f, d) for d in protected):
+            continue
+        test = is_test_file(f)
+        if test and f not in explicit and any(under(f, d) for d in test_dirs):
+            continue
+        touched.append(rel(f))
+        if files[f] == "A" and test and f not in explicit:
+            additions.append(rel(f))
+        else:
+            violations.append(rel(f))
     return {"base": (task.get("base") or "")[:10], "changed": len(files),
-            "out_of_scope": [rel(f) for f in files if scope and not under(f, scope)][:20],
-            "protected_touched": [rel(f) for f in files if any(under(f, d) for d in protected)
-                                  and not any(under(f, d) for d in test_dirs)][:20]}
+            "out_of_scope": [rel(f) for f in sorted(files) if scope and not under(f, scope)][:20],
+            "protected_touched": touched, "protected_violations": violations, "protected_added_tests": additions}
 
 # ---------- Task board ----------
 # One directory per task: tasks/<id>/task.json. The task is the source of truth; sessions only execute it.
@@ -1172,16 +1236,199 @@ def dismiss_decision(d, reason=""):
     d.update(state="dismissed", resolution="dismissed", reason=reason, resolved_at=now_utc().isoformat())
     update_decision(d)
 
+def worktree_dirtiness(path, extra_ignore=()):
+    """Count tracked and untracked changes, or return None when verification fails."""
+    if not path or not os.path.isdir(path):
+        return None
+    try:
+        top = call(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=8).strip()
+        if os.path.realpath(top) != os.path.realpath(path):
+            return None  # do not accidentally check a parent repository
+        status = call(["git", "--no-optional-locks", "-C", path, "status", "--porcelain=v1", "-z",
+                       "--untracked-files=all", "--ignore-submodules=none"], timeout=15)
+        records = iter(status.rstrip("\0").split("\0") if status else [])
+        dirty = 0
+        patterns = SCOPE_IGNORE + list(extra_ignore)
+        for record in records:
+            if len(record) < 4 or record[2] != " ":
+                return None
+            paths = [record[3:]]
+            if "R" in record[:2] or "C" in record[:2]:
+                paths.append(next(records))
+            if any(not ignored(p, patterns) for p in paths):
+                dirty += 1
+        return dirty
+    except (RuntimeError, ValueError, StopIteration):
+        return None
+
+def task_worktree(cfg, t):
+    rec = aoe_records(cfg).get(t.get("session_id"), {})
+    path, recorded = t.get("worktree"), rec.get("project_path")
+    if path and recorded and os.path.realpath(path) != os.path.realpath(recorded):
+        raise RuntimeError(L("session worktree differs from the task; inspect AoE before retrying cleanup",
+                             "会话的 worktree 与任务记录不一致；请检查 AoE 后重试清理"))
+    return path or recorded
+
+def preserve_progress(t, worktree):
+    if not worktree:
+        return
+    source = Path(worktree)/".chief"/"progress.md"
+    if not os.path.lexists(str(source)):
+        return
+    try:
+        safe_write(TASKS/t["id"]/"progress.md", source.read_bytes())
+    except OSError as exc:
+        raise RuntimeError(L("could not preserve progress for {}: {}", "无法保存 {} 的进度：{}").format(t["id"], exc)) from exc
+
+def remove_task_session(cfg, t, force=False):
+    """Preserve progress, recheck safety, then let AoE trash the session/worktree."""
+    if not t.get("session_id"):
+        raise RuntimeError(L("the task has no AoE session", "任务没有 AoE 会话"))
+    path = task_worktree(cfg, t)
+
+    def check_clean():
+        dirty = worktree_dirtiness(path, cfg.get("scope_ignore", []))
+        if dirty is None:
+            raise RuntimeError(L("cannot verify worktree cleanliness (unknown); inspect {} and retry",
+                                 "无法验证 worktree 是否干净（未知）；请检查 {} 后重试").format(path or "?"))
+        if dirty:
+            raise RuntimeError(L("dirty worktree: {} uncommitted changes; commit or stash them before cleanup",
+                                 "worktree 不干净：{} 个未提交改动；请先提交或暂存再清理").format(dirty))
+
+    if not force:
+        check_clean()
+    preserve_progress(t, path)
+    if not force:
+        check_clean()  # immediately before AoE; confirmation and copying can take time
+    aoe(cfg, "remove", t["session_id"], "--delete-worktree", "--force")
+    if path and os.path.lexists(path):
+        raise RuntimeError(L("AoE left the worktree in place at {}; inspect its trash/session and restore it before retrying cleanup",
+                             "AoE 未移走 worktree：{}；请检查回收站和会话，恢复后重试清理").format(path))
+    rec = aoe_records(cfg).get(t["session_id"])
+    if rec is not None and not (rec.get("trashed_at") or rec.get("state") == "trashed"):
+        raise RuntimeError(L("AoE did not confirm the session is in trash; inspect it before retrying cleanup",
+                             "AoE 未确认会话已移入回收站；请检查后重试清理"))
+    removed = dict(t, session_removed=True, cleaned_at=now_utc().isoformat())
+    save_task(removed)
+    return removed
+
+def clean_task(cfg, t):
+    if t.get("state") not in ("done", "abandoned"):
+        raise RuntimeError(L("only done or abandoned tasks can be cleaned", "只能清理已完成或已放弃的任务"))
+    return remove_task_session(cfg, t)
+
+def merge_status(t):
+    """Verify the task branch against its explicit base, or the repository's HEAD."""
+    repo, branch = t.get("repo"), t.get("branch")
+    if not repo or not branch:
+        return "unknown"
+    try:
+        head = call(["git", "-C", repo, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}"], timeout=8).strip()
+        base = call(["git", "-C", repo, "rev-parse", "--verify", "--end-of-options",
+                     (t.get("base_branch") or "HEAD") + "^{commit}"], timeout=8).strip()
+        ahead = call(["git", "-C", repo, "rev-list", "--count", base + ".." + head], timeout=15).strip()
+        return "merged" if int(ahead) == 0 else "unmerged"
+    except (RuntimeError, ValueError):
+        return "unknown"
+
+def branch_in_use(t, ignore_task_worktree=False):
+    try:
+        data = call(["git", "-C", t["repo"], "worktree", "list", "--porcelain", "-z"], timeout=8)
+        path = None
+        for field in data.split("\0"):
+            if field.startswith("worktree "):
+                path = field[len("worktree "):]
+            elif field == "branch refs/heads/" + t["branch"]:
+                if not ignore_task_worktree or os.path.realpath(path or "") != os.path.realpath(t.get("worktree") or ""):
+                    return True
+        return False
+    except (RuntimeError, ValueError, KeyError):
+        return None
+
+def branch_cleanup_plan(t, branches, ignore_task_worktree=False):
+    if not branches:
+        return False, L("keep branch (default)", "保留分支（默认）")
+    merged = merge_status(t)
+    if merged != "merged":
+        return False, L("keep branch ({})", "保留分支（{}）").format(merged)
+    used = branch_in_use(t, ignore_task_worktree)
+    if used is not False:
+        return False, L("keep branch (checked out or checkout status unknown)", "保留分支（已检出或检出状态未知）")
+    return True, L("delete merged branch after successful removal", "成功清理后删除已合并分支")
+
+def clean_tasks(cfg, dry_run=False, branches=False):
+    # AoE's default list includes archived sessions. Supplement its rows with
+    # persisted records for older versions that omit archives from their list.
+    sessions = dict(aoe_records(cfg))
+    for row in listings(cfg):
+        sessions[row["id"]] = dict(sessions.get(row["id"], {}), **row)
+    candidates = []
+    for task in all_tasks():
+        rec = sessions.get(task.get("session_id"))
+        if task.get("state") not in ("done", "abandoned") or rec is None:
+            continue
+        if rec.get("state") in ("trashed", "deleted") or rec.get("trashed_at"):
+            continue
+        try:
+            dirty = worktree_dirtiness(task_worktree(cfg, task), cfg.get("scope_ignore", []))
+        except RuntimeError:
+            dirty = None
+        candidates.append((task, dirty))
+    if not candidates:
+        print(L("No cleanup candidates.", "没有可清理的任务。"))
+        return 0
+    print(L("Cleanup candidates (session/worktree go to AoE trash):", "可清理任务（会话和 worktree 将移入 AoE 回收站）："))
+    for task, dirty in candidates:
+        dirt = L("unknown", "未知") if dirty is None else (L("dirty ({})", "不干净（{}）").format(dirty) if dirty else L("clean", "干净"))
+        print("{} · {} · {} · {} · {}".format(task["id"], task.get("name", ""), task.get("branch", "?"), merge_status(task), dirt))
+        if dirty != 0:
+            print(L("  Skip: worktree is dirty or cleanliness is unknown; keep branch",
+                    "  跳过：worktree 不干净或无法验证；保留分支"))
+        else:
+            _, action = branch_cleanup_plan(task, branches, ignore_task_worktree=True)
+            print("  " + action)
+    if dry_run or not any(dirty == 0 for _, dirty in candidates):
+        return 0
+    try:
+        answer = input(L("Trash the clean candidates' sessions and worktrees? (y/N) ", "将干净任务的会话和 worktree 移入回收站？(y/N) "))
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print(L("Cancelled; nothing changed.", "已取消；未作任何改动。"))
+        return 0
+    failed = False
+    for task, dirty in candidates:
+        if dirty != 0:
+            continue
+        try:
+            current = load_task(task["id"])
+            if current.get("session_id") != task.get("session_id"):
+                raise RuntimeError(L("the task's session changed; inspect it and retry", "任务的会话已改变；请检查后重试"))
+            removed = clean_task(cfg, current)
+            print(L("{}: session/worktree moved to AoE trash", "{}：会话和 worktree 已移入 AoE 回收站").format(task["id"]))
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(L("{}: cleanup failed: {}", "{}：清理失败：{}").format(task["id"], exc), file=sys.stderr)
+            failed = True
+            continue
+        delete, action = branch_cleanup_plan(removed, branches)
+        try:
+            if delete:
+                call(["git", "-C", removed["repo"], "branch", "-d", "--", removed["branch"]], timeout=15)
+                action = L("merged branch deleted", "已删除已合并分支")
+            print("{}: {}".format(task["id"], action))
+        except RuntimeError as exc:
+            print(L("{}: branch kept; deletion failed: {}", "{}：分支保留；删除失败：{}").format(task["id"], exc), file=sys.stderr)
+            failed = True
+    return 1 if failed else 0
+
 def close_task(cfg, t, abandon=False, remove_session=False, force=False):
-    if remove_session and t.get("session_id"):
-        g = git_info(t.get("worktree"))
-        if g and g["dirty"] and not force:
-            raise RuntimeError(L("the worktree has {} uncommitted changes; add --force if you do not need them",
-                                 "worktree 有 {} 个未提交改动，确认不要了再加 --force").format(g["dirty"]))
-        aoe(cfg, "remove", t["session_id"], "--delete-worktree", "--force")
-        t["session_removed"] = True
-    elif t.get("session_id"):
-        set_color(cfg, t, "none")
+    t = dict(t)
+    if t.get("session_id") and not t.get("session_removed"):
+        if remove_session:
+            t = remove_task_session(cfg, t, force=force)
+        else:
+            aoe(cfg, "session", "archive", t["session_id"])
+            t.update(session_archived=True, archived_at=now_utc().isoformat())
     t["state"] = "abandoned" if abandon else "done"
     t["closed_at"] = now_utc().isoformat()
     save_task(t)
@@ -1638,8 +1885,12 @@ def judge(it):
     elif log.get("turn") == "done" and re.search(r"[?？]\s*$|要不要|是否需要|请确认|你希望|which option|should I", reply[-200:]):
         s.append(("red", L("the agent is waiting for your decision", "Agent 在等你做决定"), "question"))
     sc, ck = it.get("scope"), it.get("checks")
-    if sc and sc["protected_touched"]:
-        s.append(("red", L("protected files changed: ", "改动了受保护文件：") + sep().join(sc["protected_touched"][:3]), "protected"))
+    violations = sc.get("protected_violations", sc["protected_touched"]) if sc else []
+    if violations:
+        s.append(("red", L("protected files changed: ", "改动了受保护文件：") + sep().join(violations[:3]), "protected"))
+    if sc and sc.get("protected_added_tests"):
+        s.append(("yellow", L("new tests in protected directories; review: ", "受保护目录中新增测试；请审查：") +
+                  sep().join(sc["protected_added_tests"]), "new-tests"))
     if sc and sc["out_of_scope"]:
         s.append(("yellow", L("{} changes out of scope: {}", "{} 个改动超出范围：{}").format(
             len(sc["out_of_scope"]), sep().join(sc["out_of_scope"][:3])), "scope"))
@@ -1804,8 +2055,9 @@ Rules:
 - Distinguish three kinds of "done": the process is idle / the agent claims it is done / there is evidence (commits,
   files, tests). Do not call anything done without evidence.
 - checks are the results of check commands chief just ran: verified evidence that outranks the agent's claims. When
-  they fail, use output_tail to say where it is stuck. A non-empty scope.protected_touched means the agent changed files
-  it must not change (such as tests): always warn the user.
+  they fail, use output_tail to say where it is stuck. scope.protected_violations lists forbidden changes: always warn
+  the user. scope.protected_added_tests lists new tests requiring yellow review, not a protection violation; include
+  their paths. For older scope data without these fields, treat scope.protected_touched as forbidden changes.
 - When there is a goal / done_when, judge how far the item is from it.
 - agent_footer is the agent's closing block (Conclusion / Evidence / Blockers / Next step / Decision needed). Prefer it,
   but it is still the agent's claim: weigh it against the evidence. When relaying a decision, keep the agent's options
@@ -1877,9 +2129,12 @@ def show(cfg, sid, n):
         out += ["  {} `{}`".format("✓" if r["ok"] else "✗ ({})".format(r["code"]), r["cmd"]) for r in ck["results"]]
     sc = scope_info(rec.get("project_path"), task, cfg.get("scope_ignore", []))
     if sc:
+        protected_count = len(sc.get("protected_violations", sc["protected_touched"]))
         out.append(L("Scope: {} files changed since {} · out of scope {} · protected touched {}",
                      "范围：自 {1} 起改动 {0} 个文件 · 超出范围 {2} · 碰受保护 {3}").format(
-            sc["changed"], sc["base"] or "HEAD", len(sc["out_of_scope"]), len(sc["protected_touched"])))
+            sc["changed"], sc["base"] or "HEAD", len(sc["out_of_scope"]), protected_count))
+        if sc.get("protected_added_tests"):
+            out.append(L("New tests to review: ", "待审查的新增测试：") + sep().join(sc["protected_added_tests"]))
     g = git_info(rec.get("project_path"))
     if g:
         out.append(L("Git: {} · uncommitted {} · last commit {} ({})", "Git：{} · 未提交 {} · 最近提交 {}（{}）").format(
@@ -1976,14 +2231,22 @@ def main():
                                           "（重新）启动草稿任务，或给已就绪的会话补发开场指令"))
     ko.add_argument("id")
     ko.add_argument("--trust", action="store_true")
-    cl = sub.add_parser("close", help=L("finish a task (keeps the session, worktree and branch by default)",
-                                        "结束任务（默认保留会话、worktree 和分支）"))
+    close_help = L("finish a task and archive its AoE session, stopping its process; keep worktree, branch and progress",
+                   "结束任务并归档 AoE 会话、停止进程；保留 worktree、分支和进度")
+    cl = sub.add_parser("close", help=close_help, description=close_help)
     cl.add_argument("id")
     cl.add_argument("--abandon", action="store_true", help=L("mark it abandoned instead of done", "标记为放弃而不是完成"))
-    cl.add_argument("--remove-session", action="store_true", help=L("also remove the AoE session and worktree (the branch stays)",
-                                                                    "同时删除 AoE 会话和 worktree（分支保留）"))
+    cl.add_argument("--remove-session", action="store_true", help=L("preserve progress, then trash the session/worktree immediately (keep branch)",
+                                                                    "保存进度后立即将会话和 worktree 移入回收站（保留分支）"))
     cl.add_argument("--force", action="store_true", help=L("remove even if the worktree has uncommitted changes",
                                                            "worktree 有未提交改动时仍然删除"))
+    clean_help = L("trash done/abandoned tasks' sessions and clean worktrees after confirmation; keep branches by default",
+                   "确认后将已完成或放弃任务的会话和干净 worktree 移入回收站；默认保留分支")
+    cn = sub.add_parser("clean", help=clean_help, description=clean_help)
+    cn.add_argument("--dry-run", action="store_true", help=L("list candidates, skips and branch actions without prompting or changing anything",
+                                                             "列出候选任务、跳过原因和分支操作；不询问、不修改"))
+    cn.add_argument("--branches", action="store_true", help=L("also delete verified merged branches after successful removal, using git branch -d",
+                                                              "成功清理后用 git branch -d 删除已验证合并的分支"))
     dl = sub.add_parser("decisions", help=L("the decision queue: workers' questions and chief's drafts",
                                             "决策队列：Worker 提出的问题，以及 chief 起草的答复"))
     dl.add_argument("--all", action="store_true", help=L("also show resolved decisions", "也显示已处理的"))
@@ -2041,7 +2304,7 @@ def main():
     sh.add_argument("--turns", type=int, default=3)
     args = ap.parse_args()
     try:
-        cfg = config()
+        cfg = load_json(CFG, {"profile": "main"}) if args.command == "clean" else config()
         if args.command == "init":
             print(L("Initialized {}. Pick sessions with sessions / track, or create a task with new.",
                     "已初始化 {}，请用 sessions / track 选择要监督的 Session，或用 new 立项").format(CFG))
@@ -2125,7 +2388,7 @@ def main():
                 ck = cks.get(t.get("session_id")) or {}
                 prog = "{}/{}".format(ck["passed"], ck["total"]) if "results" in ck else "-"
                 pend = sum(1 for d in load_decisions(t["id"]) if d["state"] == "pending")
-                print("{:24} {:10} {:6} {} {:5} {:9} {}{}".format(t["id"][:24], t["state"], t.get("tool", ""), L("checks", "检查"), prog,
+                print("{:24} {:10} {:6} {} {:5} {:9} {}{}".format(t["id"], t["state"], t.get("tool", ""), L("checks", "检查"), prog,
                                                                  (t.get("session_id") or "-")[:8], t["name"][:40],
                                                                  L("  · pending decisions {}", "  · 待决策 {}").format(pend) if pend else ""))
             if not ts:
@@ -2141,12 +2404,17 @@ def main():
                                          "会话还没就绪（可能在等你确认信任目录），进入会话处理后再试"))
                 send_kickoff(cfg, t)
             print(L("Task {} · {}", "任务 {} · {}").format(t["id"], t["state"]) + (L("\nNeeds you: ", "\n需要你：") + t["note"] if t.get("note") else ""))
+        elif args.command == "clean":
+            return clean_tasks(cfg, args.dry_run, args.branches)
         elif args.command == "close":
             t = close_task(cfg, find_task(args.id), args.abandon, args.remove_session, args.force)
             print(L("Task {} → {}; branch {} kept in {}", "任务 {} → {}；分支 {} 保留在 {}").format(t["id"], t["state"], t["branch"], t["repo"]))
             if t.get("session_removed"):
                 print(L("The session and worktree are in the AoE trash; restore with `aoe session restore {}`",
                         "会话和 worktree 已移入 AoE 回收站，可用 `aoe session restore {}` 恢复").format(t["session_id"]))
+            elif t.get("session_archived"):
+                print(L("AoE session archived and process stopped; worktree and progress kept.",
+                        "AoE 会话已归档、进程已停止；worktree 和进度已保留。"))
         elif args.command == "task":
             sid = resolve_sid(cfg, args.id)
             board = board_by_session()
