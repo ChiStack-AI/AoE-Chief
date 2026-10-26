@@ -100,7 +100,9 @@ def complete_directory(path):
     parent, prefix = os.path.split(path)
     try:
         with os.scandir(os.path.expanduser(parent or ".")) as directory:
-            matches = [entry.name for entry in directory if entry.name.startswith(prefix) and entry.is_dir()]
+            matches = [entry.name for entry in directory
+                       if entry.name.startswith(prefix)
+                       and (prefix.startswith(".") or not entry.name.startswith(".")) and entry.is_dir()]
     except OSError:
         return path
     if not matches:
@@ -325,6 +327,7 @@ class Inbox:
         self.repositories = [self.current_repo]
         self.valid_repositories = set()
         self.validation_results = queue.Queue()
+        self.recheck_results = queue.Queue()
         self.validation_thread = None
 
     # Background work: one job at a time; every job ends with a refresh.
@@ -460,6 +463,16 @@ class Inbox:
             if (self.st.get("new_task") is new and new["phase"] == "intent"
                     and new["repo_version"] == version):
                 new.update(repo_status="invalid" if error else "valid", resolved_repo=resolved, repo_error=error)
+        while True:
+            try:
+                new, version, intent_buffer, error = self.recheck_results.get_nowait()
+            except queue.Empty:
+                break
+            if (self.st.get("new_task") is new and new["phase"] == "drafting"
+                    and new["repo_version"] == version):
+                new.update(phase="intent", intent=intent_buffer, repo_status="invalid", resolved_repo=None,
+                           repo_error=error)
+                self.composer_input(new)
         new = self.st.get("new_task")
         if (not new or new["phase"] != "intent" or new["repo_status"] != "pending"
                 or time.monotonic() < new["validate_after"]
@@ -494,7 +507,7 @@ class Inbox:
 
     def draft_intent(self, new, text):
         ch = self.ch
-        path, intent_buffer = new["repo"], new["intent"]
+        path, intent_buffer, version = new["repo"], new["intent"], new["repo_version"]
         new.update(phase="drafting", intent=text)
 
         def draft():
@@ -503,10 +516,10 @@ class Inbox:
             try:
                 repo = self.resolve_repository(path)
             except Exception as exc:
-                if self.st.get("new_task") is new:
-                    new.update(phase="intent", intent=intent_buffer, repo_status="invalid", resolved_repo=None,
-                               repo_error=ch.clip(str(exc) or type(exc).__name__, 240))
-                    self.composer_input(new)
+                # Input belongs to the UI thread; cancellation can happen
+                # before it consumes this failed recheck.
+                self.recheck_results.put((new, version, intent_buffer,
+                                          ch.clip(str(exc) or type(exc).__name__, 240)))
                 return None
             if self.st.get("new_task") is new:
                 new["resolved_repo"] = repo

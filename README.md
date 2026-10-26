@@ -207,6 +207,7 @@ unstarted tasks), tracked sessions and the current repository. On the repository
 paths: absolute, relative and `~/` paths are supported, with spaces and quotes kept literally. A unique directory
 match gains a trailing slash; ambiguous matches extend to their longest common prefix. When the repository line
 is empty, repeated `Tab` cycles the same known repositories. Typing or clearing the path returns to path completion.
+Hidden names are included only when the name prefix being completed starts with `.`.
 
 Repository edits validate live in the background. The composer shows a pending or invalid state, or the resolved
 Git toplevel when valid. `Enter` from either line drafts a contract only with a nonblank intent and a valid
