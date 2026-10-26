@@ -261,10 +261,14 @@ def render(ch, st, w, h):
         status = new["repo_status"]
         if status == "valid":
             detail = [("green", L("Resolved Git toplevel: ", "Git 源仓库：") + new["resolved_repo"])]
+            if new.get("enter_blocked"):
+                detail.append(("info", L("Press Enter again to draft", "请再次按 Enter 起草")))
         elif status == "invalid":
             detail = [("red", L("Invalid repository: ", "仓库无效：") + new["repo_error"])]
         else:
-            detail = [("yellow", L("Checking repository…", "正在检查仓库…"))]
+            message = (L("Checking repository… press Enter again when ready", "正在检查仓库…完成后请再次按 Enter 起草")
+                       if new.get("enter_blocked") else L("Checking repository…", "正在检查仓库…"))
+            detail = [("yellow", message)]
     elif new:
         detail = [("head", L("Repository: ", "仓库：") + (new.get("resolved_repo") or new["repo"]))]
         if new.get("contract"):
@@ -435,7 +439,7 @@ class Inbox:
     def repository_changed(self, new, known=False):
         """Invalidate immediately; coalesce subsequent edits before doing Git I/O."""
         new.update(repo_version=new["repo_version"] + 1, resolved_repo=None, repo_error="",
-                   repo_status="pending", validate_after=time.monotonic() + 0.12)
+                   repo_status="pending", enter_blocked=False, validate_after=time.monotonic() + 0.12)
         if not new["repo"]:
             new.update(repo_status="invalid", repo_error=self.ch.L("Repository is empty", "仓库路径为空"))
         elif known and new["repo"] in self.valid_repositories:
@@ -682,7 +686,10 @@ class Inbox:
                         self.repository_changed(new)
                 return
             if k in ("\n", "\r", "KEY_ENTER"):
-                self.validate_repository()
+                # A queued success must not turn a pending Enter into a submission.
+                if new["repo_status"] == "pending":
+                    new["enter_blocked"] = True
+                    return
                 text = new["intent"].strip()
                 if text and new["repo_status"] == "valid" and not self.st["busy"]:
                     self.st["input"] = None

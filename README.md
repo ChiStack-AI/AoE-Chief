@@ -210,7 +210,9 @@ is empty, repeated `Tab` cycles the same known repositories. Typing or clearing 
 
 Repository edits validate live in the background. The composer shows a pending or invalid state, or the resolved
 Git toplevel when valid. `Enter` from either line drafts a contract only with a nonblank intent and a valid
-repository; the repository is checked again before drafting. Invalid input stays editable and creates no artifacts.
+repository; the repository is checked again before drafting. If validation is pending, `Enter` shows a checking
+message and keeps both lines editable. Once validation succeeds, press `Enter` again to draft.
+Invalid input stays editable and creates no artifacts.
 `Ctrl-U` clears the active line and Backspace edits it. Queued paste input is processed in batches, preserving
 characters and order while keeping the UI responsive, without a redraw or Git validation for every character.
 
