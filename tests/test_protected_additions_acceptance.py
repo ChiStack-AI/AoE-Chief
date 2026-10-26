@@ -66,6 +66,23 @@ class ProtectedAdditionsTests(ChiefFixture):
         self.write(path, "# revised after commit\n")
         self.assert_yellow_addition(path)
 
+    def test_copy_of_an_unchanged_protected_test_is_a_new_test_for_review(self):
+        source, added = "tests/test_existing.py", "tests/test_copied.py"
+        original = (self.repo / source).read_text(encoding="utf-8")
+        self.write(added, original)
+        self.git("add", added)
+        self.git("commit", "-q", "-m", "copy existing coverage into a new regression file")
+        signals, _ = self.assert_yellow_addition(added)
+        self.assertEqual((self.repo / source).read_text(encoding="utf-8"), original)
+        self.assertNotIn(source, self.messages(signals, "red"))
+
+    def test_new_test_review_remains_visible_alongside_a_protected_violation(self):
+        existing, added = "tests/test_existing.py", "tests/test_additional.py"
+        self.write(existing, "# modified protected acceptance tests\n")
+        self.write(added, "# independent new regression\n")
+        self.assert_red(existing)
+        self.assert_yellow_addition(added)
+
     def test_review_lists_every_new_test_path_without_truncating_after_three(self):
         paths = ["tests/test_regression_%02d.py" % n for n in range(6)]
         for path in paths:

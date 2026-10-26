@@ -263,6 +263,29 @@ class CleanupPreservationTests(CleanupFixture):
         self.assert_removed(task)
         self.assertIsNone(self.progress_at_remove[task["session_id"]])
 
+    def test_current_progress_replaces_an_older_archive_before_removal(self):
+        task = self.task()
+        saved = chief.TASKS / task["id"] / "progress.md"
+        saved.write_text("obsolete progress from an earlier turn\n")
+        expected = (Path(task["worktree"]) / ".chief" / "progress.md").read_bytes()
+        code, out, _ = self.clean()
+        self.assertEqual(code, 0, out)
+        self.assert_removed(task)
+        self.assertEqual(self.progress_at_remove[task["session_id"]], expected)
+        self.assertEqual(saved.read_bytes(), expected)
+
+    def test_missing_worktree_progress_preserves_an_existing_archive(self):
+        task = self.task()
+        (Path(task["worktree"]) / ".chief" / "progress.md").unlink()
+        saved = chief.TASKS / task["id"] / "progress.md"
+        expected = b"progress already preserved by an earlier operation\n"
+        saved.write_bytes(expected)
+        code, out, _ = self.clean()
+        self.assertEqual(code, 0, out)
+        self.assert_removed(task)
+        self.assertEqual(self.progress_at_remove[task["session_id"]], expected)
+        self.assertEqual(saved.read_bytes(), expected)
+
     def test_progress_copy_failure_blocks_only_that_task(self):
         failed = self.task("a-copy-fails")
         good = self.task("b-continues")
@@ -276,6 +299,8 @@ class CleanupPreservationTests(CleanupFixture):
         self.assertEqual(self.stored(failed), failed)
         self.assertTrue(self.branch_exists(failed["branch"]))
         self.assertNotIn(failed["session_id"], self.progress_at_remove)
+        self.assertFalse(any(a[0] == "remove" and a[1] == failed["session_id"] for a in self.operations),
+                         "a failed progress copy must block even an attempted AoE removal")
         self.assert_removed(good)
 
     def test_aoe_failure_is_reported_and_does_not_mark_removal_or_delete_branch(self):
@@ -330,6 +355,28 @@ class CleanupPreservationTests(CleanupFixture):
         self.assertRegex(out.lower(), r"unknown|cannot verify|unverif")
         self.assertEqual(self.stored(unknown), unknown)
         self.assertTrue(Path(unknown["worktree"]).exists())
+        self.assert_removed(good)
+
+    def test_failed_cleanliness_verification_is_unknown_even_when_head_is_readable(self):
+        unknown = self.task("a-verification-fails")
+        good = self.task("b-continues")
+        self.assertIsNotNone(chief.git_head(unknown["worktree"]))
+        real_call = chief.call
+
+        def fail_verification(args, *a, **kw):
+            if args[0] == "git" and unknown["worktree"] in args and any(
+                    command in args for command in ("status", "diff", "ls-files", "diff-index", "diff-files")):
+                raise RuntimeError("worktree cleanliness check denied")
+            return real_call(args, *a, **kw)
+
+        with mock.patch.object(chief, "call", side_effect=fail_verification):
+            _, out, _ = self.clean("--branches")
+        self.assertIn(unknown["id"], out)
+        self.assertRegex(out.lower(), r"unknown|cannot verify|unverif|check denied")
+        self.assertEqual(self.stored(unknown), unknown)
+        self.assertTrue(Path(unknown["worktree"]).exists())
+        self.assertTrue(self.branch_exists(unknown["branch"]))
+        self.assertFalse(any(a[0] == "remove" and a[1] == unknown["session_id"] for a in self.operations))
         self.assert_removed(good)
 
     def test_cleanliness_is_rechecked_after_confirmation(self):
@@ -459,6 +506,7 @@ class CleanupBranchTests(CleanupFixture):
         for task in (first, second):
             self.assert_removed(task)
         self.assertTrue(self.branch_exists(first["branch"]))
+        self.assertFalse(self.branch_exists(second["branch"]), "a branch failure must not stop later branch cleanup")
 
 
 class CloseArchiveTests(CleanupFixture):
@@ -578,6 +626,23 @@ class InboxCleanupTests(CleanupFixture):
         self.assertTrue(self.branch_exists(task["branch"]))
         self.assertFalse(self.stored(task).get("session_removed"))
         self.assertFalse(any(a[0] == "remove" for a in self.mutations()))
+
+    def test_declining_first_confirmation_does_not_close_archive_or_offer_cleanup(self):
+        task = self.task(state="review")
+        app = self.inbox(task)
+        before = self.snapshot()
+        for answer in ("\n", "n", "\x1b"):
+            with self.subTest(answer=repr(answer)):
+                app.key("c")
+                self.assertIsNotNone(app.st["confirm"])
+                self.assertIn("y/N", app.st["confirm"]["prompt"])
+                app.answered(answer)
+                app.validate_repository()
+                self.assertIsNone(app.st["confirm"])
+                self.assertEqual(self.stored(task), task)
+                self.assertEqual(self.sessions[task["session_id"]]["state"], "live")
+                self.assertEqual(self.mutations(), [])
+                self.assertEqual(self.snapshot(), before)
 
     def test_accepting_second_confirmation_preserves_progress_and_keeps_branch(self):
         task = self.task(state="review")
