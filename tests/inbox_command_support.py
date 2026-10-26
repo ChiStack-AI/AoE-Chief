@@ -103,7 +103,13 @@ if os.environ.get("CHIEF_ACCEPTANCE_TMUX_FAIL"):
     sys.exit(23)
 args = sys.argv[1:]
 if args[0] in ("display-message", "display"):
-    print("acceptance-current" if "session" in " ".join(args) else "@42")
+    query = " ".join(args)
+    if "pane_id" in query:
+        print("%17")
+    elif "pane_current_path" in query:
+        print(root / "source")
+    else:
+        print("acceptance-current" if "session" in query else "@42")
 elif args[0] in ("new-window", "new-session"):
     print("@42")
 elif args[0] == "split-window":

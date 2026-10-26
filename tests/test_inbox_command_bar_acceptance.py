@@ -548,3 +548,117 @@ class BackgroundAndCancellationTests(support.CommandFixture):
         reply.assert_called_once_with(self.cfg, "live-2222", "Literal reply 雪")
         self.draft.assert_not_called()
         self.start.assert_not_called()
+
+
+class HalfWidthTests(support.CommandFixture):
+    """Usability at half of 80/120/160 columns, allowing for a tmux divider."""
+
+    def narrow_screen(self):
+        height, width = self.scr.getmaxyx()
+        rows = tui.render(chief, self.app.st, width, height)
+        self.assertEqual(len(rows), height)
+        lines = ["".join(text for text, _ in row) for row in rows]
+        self.assertTrue(all(tui.width(line) == width for line in lines))
+        return lines
+
+    def test_navigation_reply_and_refresh_remain_usable_at_half_width_in_both_languages(self):
+        self.selected_items()
+        with mock.patch.object(chief, "reply_session", return_value=True) as reply:
+            for lang in ("en", "zh"):
+                for width in (39, 59, 79):
+                    with self.subTest(lang=lang, width=width):
+                        chief.LANG = lang
+                        self.scr.getmaxyx.return_value = (28, width)
+                        self.app = tui.Inbox(self.cfg, chief, 3600)
+
+                        def inspect_input():
+                            self.assertEqual(self.app.selected()["sid"], "live-2222")
+                            self.assertIn("Ready 雪", self.narrow_screen()[-2])
+
+                        self.scenario(composer.Action(self.narrow_screen), "j", "r", "Ready 雪",
+                                      composer.Action(inspect_input), "\n", composer.Check(self.assert_idle),
+                                      "g", composer.Check(self.assert_idle), "k",
+                                      composer.Action(lambda: self.assertEqual(self.app.selected()["sid"], "live-1111")),
+                                      composer.Action(self.narrow_screen))
+            self.assertEqual(reply.call_count, 6)
+            self.assertTrue(all(call[0] == (self.cfg, "live-2222", "Ready 雪")
+                                for call in reply.call_args_list))
+
+    def test_command_editing_completion_history_and_output_fit_half_width(self):
+        self.task()
+        draft = "nudge task-alpha " + self.q("Long guidance " * 8 + "visible-tail 雪")
+        for width in (39, 59, 79):
+            with self.subTest(width=width):
+                self.scr.getmaxyx.return_value = (28, width)
+                self.app = tui.Inbox(self.cfg, chief, 3600)
+
+                def command_visible():
+                    self.assert_buffer("close task-alpha")
+                    lines = self.narrow_screen()
+                    self.assertIn("task-alpha", lines[-2])
+                    self.assertIn("Tab", lines[-1])
+                    self.assertIn("Esc", lines[-1])
+
+                def output_visible():
+                    self.assert_idle()
+                    self.assertIn("task-alpha", "\n".join(self.narrow_screen()[1:-2]))
+
+                self.scenario(*self.command("close task-a", submit=False), "\t",
+                              self.completes("close task-alpha"), composer.Action(command_visible), "\x1b",
+                              *self.command("tasks"), composer.Check(output_visible),
+                              *self.command(draft, submit=False),
+                              composer.Action(lambda: self.assertIn("visible-tail 雪", self.narrow_screen()[-2])),
+                              (tui.curses.KEY_UP,), composer.Action(lambda: self.assert_buffer("tasks")),
+                              (tui.curses.KEY_DOWN,), composer.Action(lambda: self.assert_buffer(draft)), "\x1b")
+
+    def test_delegation_composer_keeps_both_fields_editable_at_half_width(self):
+        for lang in ("en", "zh"):
+            for width in (39, 59, 79):
+                with self.subTest(lang=lang, width=width):
+                    chief.LANG = lang
+                    self.scr.getmaxyx.return_value = (28, width)
+                    self.app = tui.Inbox(self.cfg, chief, 3600)
+
+                    def fields_visible():
+                        lines = self.narrow_screen()
+                        self.assertIn("Import 雪", lines[-3])
+                        self.assertRegex(lines[-3], r"intent|任务意图")
+                        self.assertRegex(lines[-2], r"Repository|仓库")
+
+                    self.scenario("N", "Import 雪", composer.Action(fields_visible),
+                                  (tui.curses.KEY_DOWN,), "\x15", str(self.repo),
+                                  composer.Action(fields_visible), (tui.curses.KEY_UP,), "\x1b",
+                                  composer.Action(self.narrow_screen))
+        self.assertFalse(chief.all_tasks())
+        self.draft.assert_not_called()
+        self.start.assert_not_called()
+
+    def test_destructive_confirmation_and_scrollable_output_are_usable_at_half_width(self):
+        self.selected_items()
+        self.control["rules"].append(dict(argv=["session", "show", "narrow"],
+            stdout="\n".join("row{:02d} ".format(n) + "readable wrapped output 雪 " * 3
+                             for n in range(30)) + "\n"))
+        self.write_control()
+        for width in (39, 59, 79):
+            with self.subTest(width=width):
+                self.scr.getmaxyx.return_value = (28, width)
+                self.app = tui.Inbox(self.cfg, chief, 3600)
+                seen = set()
+
+                def confirmation_visible():
+                    self.assertIsNotNone(self.app.st["confirm"])
+                    screen = "\n".join(self.narrow_screen())
+                    self.assertIn("task-alpha", screen)
+                    self.assertRegex(screen, r"[yY]/N")
+
+                def capture():
+                    seen.update(re.findall(r"row\d{2}", "\n".join(self.narrow_screen()[1:-2])))
+
+                scroll = []
+                for key in (tui.curses.KEY_PPAGE,) * 24 + (tui.curses.KEY_NPAGE,) * 24:
+                    scroll.extend([(key,), composer.Action(capture)])
+                self.scenario(*self.command("close task-alpha --force"),
+                              composer.Action(confirmation_visible), "\n", composer.Check(self.assert_idle),
+                              *self.command("aoe session show narrow"), composer.Check(self.assert_idle), *scroll)
+                self.assertEqual(chief.load_task("task-alpha")["state"], "running")
+                self.assertEqual(seen, {"row{:02d}".format(n) for n in range(30)})
