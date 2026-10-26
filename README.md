@@ -283,12 +283,60 @@ After `c` successfully closes and archives a task, a second `(y/N)` confirmation
 session and worktree. Enter, `n` or Esc keeps it archived. Accepting preserves progress, checks cleanliness
 again and keeps the branch. A cleanup failure leaves the task closed and shows how to inspect or retry it.
 
+Press `:` for a one-line **command bar**, with a compact cheat sheet immediately above it. It accepts
+`tasks`, `show`, `new`, `decide`, `nudge`, `close`, `clean`, `track`, `untrack` and `tick`, either bare or
+with an optional `chief` prefix. Existing Chief CLI flags keep their meanings. It also accepts `aoe list`
+(optionally `--json`) and `aoe session show|start|stop|archive|unarchive|restore <ID>` (`show` accepts
+`--json`). The configured AoE profile and `AOE_BIN` resolution apply throughout.
+
+```text
+:tasks
+:chief show csv-import --turns 5
+:nudge csv-import "Keep quoted commas and Unicode intact"
+:decide csv-import:2 --reply "Use the existing parser"
+:new "Import CSV receipts" --repo '/home/me/project with spaces'
+:aoe session restore <trashed-session-ID>
+```
+
+`Tab` completes supported command names and context-appropriate task/session IDs; `decide` completes
+pending decision IDs. Archived sessions complete for `unarchive`, and trashed sessions for `restore`.
+Completion reads a background cache, so input stays responsive; if data is still loading, try Tab again.
+Up/Down recalls per-inbox command history and restores your unsubmitted draft. Ctrl-U clears the line;
+Backspace edits it. `Enter` submits once and runs the command in the background. Stdout, stderr, errors
+and exit status appear in the detail pane; PgUp/PgDn scroll output, which survives refresh and selection
+changes. `Esc` dismisses unsubmitted input or a confirmation. During execution it terminates the owned
+command process and its descendants, discarding late results. Already completed side effects are not undone.
+After completion, Esc hides the output so you can inspect the selected task again.
+
+`close`, `clean`, `aoe session stop` and `aoe session archive` always require explicit `y/N` confirmation,
+including when flags such as `--force` or `--dry-run` are present. Enter, `n` and Esc decline. A clean's
+candidate list gets its own confirmation before any removal; cleanup safeguards and branch retention
+still apply. A new intent's contract is reviewed inside the inbox: Enter approves, `e` edits, `n` aborts,
+and Esc cancels. Explicit `new --yes` retains its normal CLI behavior.
+
+The command bar is restricted: quoted arguments become literal argv values. Unquoted chaining,
+pipelines, redirection, globbing, variable expansion and command substitution are rejected before launch;
+arbitrary executables are unsupported. Quoted punctuation is literal data, never evaluated as shell code.
+Registered task checks still run through the existing check mechanism.
+
+Use `chief console` for a tmux console: the inbox is on the **left** and an **interactive user shell**
+is on the **right** by default. The shell prints the same cheat sheet first and starts in your home
+directory (`~`); configure it with `chief console --shell-cwd ~/workspace`. The inbox retains its project
+directory. The inbox supports narrow, half-width panes, including Unicode input, navigation, delegation,
+command editing and scrolling. `chief console --layout top-bottom` places the inbox at the top and the
+shell at the bottom; `--layout left-right` selects the default explicitly. `--every` sets the inbox's
+refresh interval. Inside tmux, console splits the current window and runs the inbox in its original pane.
+Outside tmux it creates a session, configures both panes, then attaches. Missing tmux and launcher errors
+are reported on the CLI. The interactive shell supports your usual executables, pipelines and redirection;
+the inbox command bar remains restricted. Use the tmux pane-switching keys to move between them.
+
 To keep the inbox and the driver as standing sessions in AoE, register them as custom agents in
-`~/.config/agent-of-empires/config.toml`:
+`~/.config/agent-of-empires/config.toml`. Point the custom agent named `chief` at `chief console` so
+the AoE **chief inbox** session opens with the default split (use your actual absolute installation path):
 
 ```toml
 [session]
-custom_agents = { chief = "python3 /home/you/aoe-chief/chief.py inbox", chief-watch = "python3 /home/you/aoe-chief/chief.py watch --every 300" }
+custom_agents = { chief = "python3 /home/you/aoe-chief/chief.py console", chief-watch = "python3 /home/you/aoe-chief/chief.py watch --every 300" }
 ```
 
 ```bash

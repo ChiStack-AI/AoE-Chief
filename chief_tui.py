@@ -6,6 +6,7 @@ running checks; automation stays in `chief.py watch`. Actions go through the sam
 background thread, because confirming delivery to a worker can take tens of seconds. Standard library only.
 """
 import curses
+import codecs
 from datetime import datetime
 import json
 import locale
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import queue
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -190,7 +192,8 @@ def keys_for(ch, e):
         k.append(L("c close", "c 验收"))
     if e:
         k.append(L("o open", "o 进入"))
-    return [L("N new task", "N 新任务")] + k + [L("t tick", "t tick"), L("g refresh", "g 刷新"), L("q quit", "q 退出")]
+    return [L("N new task", "N 新任务")] + k + [L(": command", ": 命令"), L("t tick", "t tick"),
+                                              L("g refresh", "g 刷新"), L("q quit", "q 退出")]
 
 # ---------- Rendering: state → rows of (text, style) segments ----------
 
@@ -208,16 +211,26 @@ def render(ch, st, w, h):
     L, es = ch.L, st.get("entries") or []
     new = st.get("new_task")
     composing = new and new["phase"] == "intent"
+    command_bar = bool(st.get("input") and st["input"].get("command"))
+    sheet = [line for text in ch.command_cheat_sheet() for line in wrap(text, max(1, w))] if command_bar else []
+    confirmation = wrap(st["confirm"]["prompt"], max(1, w)) if st.get("confirm") else []
+    sheet = sheet[:max(0, h - 4)]
+    bottom_h = 3 if composing else (len(confirmation) + 1 if confirmation else 2 + len(sheet))
     rows = []
     n = {lv: sum(1 for e in es if e["level"] == lv) for lv in ORDER}
     left = " " + L("AoE Chief · {} needs you · {} to confirm · {} to accept · {} tracked",
                    "AoE Chief · 需要你 {} · 待确认 {} · 待验收 {} · 跟踪 {}").format(
         n["red"], n["draft"], n["green"], len(es))
     right = "{} · {} ".format(st.get("tick_note", ""), st.get("clock", ""))
+    if w < 90:
+        left = L("Chief · {} tracked · !{} ?{} +{}", "Chief · 跟踪 {} · !{} ?{} +{}").format(
+            len(es), n["red"], n["draft"], n["green"])
+        right = st.get("clock", "") + " "
     rows.append([(fit(left, max(0, w - width(right))), "header"), (fit(right, min(w, width(right))), "header")])
-    if not es and not new and h >= 5:
+    if not es and not new and h >= bottom_h + 3:
         rows.append([(fit(" " + (st.get("empty") or L("Loading…", "加载中…")), w), "info")])
     list_h = min(max(0, h - 4), max(3, (h - 4) // 3)) if es else 0
+    list_h = min(list_h, max(0, h - bottom_h - 2))
     sel = max(0, min(st.get("sel", 0), len(es) - 1))
     top, used = sel, 2                  # reserve a heading and the selected item
     while top > 0:
@@ -255,7 +268,6 @@ def render(ch, st, w, h):
     title = L("New task contract", "新任务合同") if new else (e["title"] if e else "")
     bar = "── " + fit(title, max(0, w - 8)).rstrip() + " " if title else ""
     rows.append([(fit(bar + "─" * max(0, w - width(bar)), w), "dim")])
-    bottom_h = 3 if composing else 2
     body_h = max(0, h - len(rows) - bottom_h)
     body = []
     detail = e["detail"] if e else []
@@ -277,6 +289,8 @@ def render(ch, st, w, h):
             detail.append(("text", json.dumps(new["contract"], ensure_ascii=False, indent=2)))
         else:
             detail.append(("text", L("Task intent: ", "任务意图：") + new.get("intent", "")))
+    elif st.get("command_output") is not None:
+        detail = [("text", st["command_output"])]
     for style, text in detail:
         for line in wrap(text, max(10, w - 2), " "):
             body.append((style, line))
@@ -291,9 +305,14 @@ def render(ch, st, w, h):
             active = new["active"] == field
             rows.append(input_row(("> " if active else "  ") + prompt, new[field], w, active))
     elif st.get("input") is not None:
+        for line in sheet:
+            rows.append([(fit(line, w), "dim")])
         rows.append(input_row(st["input"]["prompt"], st["input"]["buf"], w))
     elif st.get("confirm"):
-        rows.append([(fit(st["confirm"]["prompt"], w), "prompt")])
+        for line in confirmation:
+            rows.append([(fit(line, w), "prompt")])
+    elif st.get("command_prompt"):
+        rows.append([(fit(st["command_prompt"], w), "prompt")])
     else:
         msg = st.get("msg", "")
         if st.get("busy"):
@@ -301,11 +320,23 @@ def render(ch, st, w, h):
         rows.append([(fit(" " + msg, w), "msg")])
     more = L(" PgUp/PgDn scroll", " PgUp/PgDn 滚动") if len(body) > body_h else ""
     keys = "  ".join(keys_for(ch, e)) + L("  ↑↓ move", "  ↑↓ 选择")
+    if command_bar:
+        keys = L("Tab complete  ↑↓ history  Enter run  Esc cancel", "Tab 补全  ↑↓ 历史  Enter 运行  Esc 取消")
+        if w < 60:
+            keys = "Tab  ↑↓  Enter  Esc"
+    elif st.get("command_prompt"):
+        keys = L("Enter create  e edit  n abort  Esc cancel", "Enter 创建  e 编辑  n 取消  Esc 取消")
+    elif st.get("confirm"):
+        keys = L("y confirm  Enter/n/Esc decline", "y 确认  Enter/n/Esc 取消")
+    elif st.get("busy") and st.get("command_output") is not None:
+        keys = L("Esc cancel command  ↑↓ move  PgUp/PgDn scroll", "Esc 取消命令  ↑↓ 选择  PgUp/PgDn 滚动")
     if new:
         if new["phase"] == "intent":
             keys = (L("↑↓ line  Enter draft  Tab complete path  Esc cancel", "↑↓ 切换行  Enter 起草  Tab 补全路径  Esc 取消")
                     if new["active"] == "repo" else
                     L("↑↓ line  Enter draft  Tab repository  Esc cancel", "↑↓ 切换行  Enter 起草  Tab 切换仓库  Esc 取消"))
+            if w < 60:
+                keys = "↑↓  Enter  Tab  Esc"
         elif new["phase"] == "preview":
             keys = L("Enter create & start  e edit  Esc cancel", "Enter 创建并启动  e 编辑  Esc 取消")
         elif new["phase"] == "drafting":
@@ -316,6 +347,96 @@ def render(ch, st, w, h):
     return [fit_row(row, w) for row in rows[:h]]
 
 # ---------- The app ----------
+
+class CommandExecution:
+    """Own one process group. Reader threads only enqueue data, never touch UI state."""
+    def __init__(self, argv, protocol=False):
+        self.argv, self.protocol = argv, protocol
+        self.events = queue.Queue()
+        self.cancelled = threading.Event()
+        self.process = None
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        try:
+            if self.cancelled.is_set():
+                return
+            self.process = subprocess.Popen(self.argv, stdin=subprocess.PIPE if self.protocol else subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            if self.cancelled.is_set():
+                self.stop()
+            readers = []
+            for stream, channel in ((self.process.stdout, "stdout"), (self.process.stderr, "stderr")):
+                thread = threading.Thread(target=self.read, args=(stream, channel), daemon=True)
+                readers.append(thread)
+                thread.start()
+            code = self.process.wait()
+            for thread in readers:
+                thread.join()
+            self.events.put(("done", code))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+            self.events.put(("done", 1))
+        finally:
+            if self.process:
+                for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                    if stream:
+                        stream.close()
+
+    def read(self, stream, channel):
+        try:
+            if self.protocol and channel == "stdout":
+                for line in stream:
+                    event = json.loads(line.decode("utf-8"))
+                    self.events.put((event["kind"], event["data"]))
+            else:
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                while True:
+                    data = os.read(stream.fileno(), 4096)
+                    if not data:
+                        tail = decoder.decode(b"", final=True)
+                        if tail:
+                            self.events.put((channel, tail))
+                        break
+                    self.events.put((channel, decoder.decode(data)))
+        except (OSError, ValueError, KeyError) as exc:
+            if not self.cancelled.is_set():
+                self.events.put(("error", str(exc)))
+
+    def answer(self, answer):
+        if self.cancelled.is_set() or not self.process or not self.process.stdin:
+            return
+        try:
+            self.process.stdin.write((json.dumps(answer) + "\n").encode("utf-8"))
+            self.process.stdin.flush()
+        except (OSError, ValueError):
+            pass  # The completion event explains an exited worker.
+
+    def cancel(self):
+        self.cancelled.set()
+        threading.Thread(target=self.stop, daemon=True).start()
+
+    def stop(self):
+        process = self.process
+        if not process:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            pass
+        # Kill remaining descendants too, even if the group leader exited first.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
 
 class Inbox:
     def __init__(self, cfg, ch, every):
@@ -330,6 +451,206 @@ class Inbox:
         self.recheck_results = queue.Queue()
         self.closed_tasks = queue.Queue()
         self.validation_thread = None
+        self.execution = None
+        self.command_history = []
+        self.history_index = 0
+        self.history_draft = ""
+        self.completions = {"tasks": [], "task_sessions": [], "sessions": {}, "decisions": []}
+        self.command_editor = None
+
+    def open_command(self):
+        self.history_index = len(self.command_history)
+        self.history_draft = ""
+        self.st["input"] = {"prompt": ": ", "buf": "", "then": self.submit_command,
+                            "empty": False, "command": True}
+
+    def submit_command(self, text):
+        self.command_history.append(text)
+        self.st.update(command_output="$ " + text + "\n", scroll=0)
+        try:
+            target, argv = self.ch.parse_inbox_command(text)
+        except (ValueError, TypeError) as exc:
+            self.st["command_output"] += self.ch.L("Error: ", "错误：") + str(exc) + "\n"
+            return
+        dangerous = (target == "chief" and argv[0] in ("close", "clean") or
+                     target == "aoe" and argv[:2] in (["session", "stop"], ["session", "archive"]))
+        if dangerous:
+            label = " ".join((["aoe"] if target == "aoe" else []) + argv)
+            self.confirm(label + "? (y/N)", lambda: self.start_command(target, argv))
+        else:
+            self.start_command(target, argv)
+
+    def start_command(self, target, argv):
+        if not self.lock.acquire(blocking=False):
+            self.st["msg"] = self.ch.L("busy", "忙")
+            self.st["command_output"] += self.ch.L("Error: busy; retry when the current action finishes.\n",
+                                                   "错误：忙；当前操作完成后请重试。\n")
+            return
+        command = ([sys.executable, str(Path(self.ch.__file__).resolve()), "_inbox_worker"] + argv
+                   if target == "chief" else [self.ch.aoe_bin(), "-p", self.cfg["profile"]] + argv)
+        self.execution = CommandExecution(command, protocol=target == "chief")
+        self.st.update(busy=self.ch.L("running command", "运行命令"), busy_since=time.time(), command_prompt=None)
+        try:
+            self.execution.start()
+        except Exception as exc:
+            self.st["command_output"] += self.ch.L("Error: ", "错误：") + str(exc) + "\n"
+            self.execution = None
+            self.st["busy"] = None
+            self.lock.release()
+
+    def command_answer(self, answer):
+        if self.execution:
+            self.st["command_prompt"] = None
+            self.execution.answer(answer)
+
+    def poll_command(self):
+        execution = self.execution
+        if not execution:
+            return
+        for _ in range(256):
+            try:
+                kind, data = execution.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind in ("stdout", "stderr", "error"):
+                text = str(data)
+                text = "".join(c for c in text if c in "\n\t" or c.isprintable())
+                self.st["command_output"] += (self.ch.L("\nError: ", "\n错误：") if kind == "error" else "") + text
+            elif kind == "prompt":
+                self.st["scroll"] = 10 ** 9  # Review the newest contract/candidate list.
+                if data["contract"]:
+                    self.st["command_prompt"] = data["text"]
+                else:
+                    self.confirm(data["text"], lambda: self.command_answer("y"))
+                    self.st["confirm"].update(command=True, declined_then=lambda: self.command_answer("n"))
+            elif kind == "editor":
+                self.command_editor = data
+            elif kind == "done":
+                self.execution = None
+                self.st.update(busy=None, command_prompt=None)
+                if self.st.get("confirm", {}) and self.st["confirm"].get("command"):
+                    self.st["confirm"] = None
+                self.st["command_output"] += self.ch.L("\n[exit status {}]\n", "\n[退出码 {}]\n").format(data)
+                self.lock.release()
+
+                def reload_config():
+                    cfg = self.ch.config()
+                    self.cfg.clear()
+                    self.cfg.update(cfg)
+                self.job(self.ch.L("refreshing", "刷新中"), reload_config)
+                break
+
+    def cancel_command(self):
+        execution, self.execution = self.execution, None
+        if not execution:
+            return
+        execution.cancel()
+        self.command_editor = None
+        self.st.update(busy=None, command_prompt=None, confirm=None)
+        self.st["command_output"] += self.ch.L(
+            "\nCancelled: terminating owned process; already completed side effects remain.\n",
+            "\n已取消：正在终止所属进程；已完成操作保留。\n")
+        self.st["msg"] = self.ch.L("cancelled", "已取消")
+        self.lock.release()
+
+    def edit_command(self, scr):
+        request, self.command_editor = self.command_editor, None
+        execution = self.execution
+        if not request or not execution:
+            return
+        status = 1
+        try:
+            curses.def_prog_mode()
+            curses.endwin()
+            status = subprocess.call(request["argv"] + [request["path"]])
+        except (OSError, KeyboardInterrupt) as exc:
+            self.st["command_output"] += "\n" + str(exc) + "\n"
+        finally:
+            curses.reset_prog_mode()
+            scr.clear()
+        if self.execution is execution:
+            execution.answer(status)
+
+    def history(self, direction):
+        inp = self.st["input"]
+        if self.history_index == len(self.command_history):
+            self.history_draft = inp["buf"]
+        self.history_index = min(len(self.command_history), max(0, self.history_index + direction))
+        inp["buf"] = (self.history_draft if self.history_index == len(self.command_history)
+                      else self.command_history[self.history_index])
+
+    def complete_command(self):
+        inp, ch = self.st["input"], self.ch
+        text = inp["buf"]
+        try:
+            tokens = shlex.split(text)
+        except ValueError:
+            return
+        if not tokens or text[-1:].isspace():
+            tokens.append("")
+        prefix = tokens[-1]
+        if tokens == ["chief"]:
+            inp["buf"] += " "
+            return
+        args = tokens[1:] if tokens[:1] == ["chief"] else tokens
+        if tokens[:1] == ["chief"] and args[:1] == ["aoe"]:
+            return
+        cache, candidates = self.completions, []
+        if len(args) == 1:
+            candidates = list(ch.CHIEF_COMMANDS) + ([] if tokens[:1] == ["chief"] else ["chief", "aoe"])
+        elif args[0] == "aoe":
+            if len(args) == 2:
+                candidates = ["list", "session"]
+            elif args[1] == "session" and len(args) == 3:
+                candidates = ch.SESSION_COMMANDS
+            elif args[1] == "session" and len(args) == 4:
+                op = args[2]
+                candidates = [sid for sid, state in cache["sessions"].items()
+                              if op in ch.SESSION_COMMANDS and (op == "show" or
+                                  state == {"restore": "trashed", "unarchive": "archived"}.get(op, "live"))]
+        elif not prefix.startswith("-"):
+            name = args[0]
+            # Count positional arguments, excluding option values, so a task ID
+            # also completes after flags such as show --turns 5 <ID>.
+            parser = ch.argument_parser(ch.CommandParser)
+            sub = next(a for a in parser._actions if hasattr(a, "choices") and isinstance(a.choices, dict))
+            command_parser = sub.choices.get(name)
+            position, expecting, options = 0, False, True
+            if command_parser:
+                for token in args[1:-1]:
+                    if expecting:
+                        expecting = False
+                        continue
+                    if token == "--" and options:
+                        options = False
+                        continue
+                    action = command_parser._option_string_actions.get(token.split("=", 1)[0]) if options else None
+                    if action:
+                        expecting = action.nargs != 0 and "=" not in token
+                    else:
+                        position += 1
+                if not expecting:
+                    if name in ("track", "untrack"):
+                        candidates = (list(self.cfg.get("tracked_ids", [])) if name == "untrack" else
+                                      [sid for sid, state in cache["sessions"].items() if state == "live"])
+                    elif position == 0:
+                        if name == "decide":
+                            candidates = cache["decisions"]
+                        elif name in ("show", "close", "nudge"):
+                            candidates = cache["tasks"] + (list(cache["sessions"]) if name == "show" else cache["task_sessions"])
+        matches = sorted({value for value in candidates if value.startswith(prefix)})
+        if matches:
+            completed = os.path.commonprefix(matches)
+            # IDs may contain spaces or punctuation. Insert literal argv data,
+            # and leave already quoted/escaped words intact rather than corrupting them.
+            if prefix and not text.endswith(prefix):
+                return
+            completed = shlex.quote(completed) if completed else ""
+            if len(matches) == 1:
+                completed += " "
+            inp["buf"] = text[:len(text) - len(prefix)] + completed if prefix else text + completed
+            if len(matches) > 1:
+                self.st["msg"] = "  ".join(matches)
 
     # Background work: one job at a time; every job ends with a refresh.
     def job(self, label, fn, refresh=True):
@@ -379,7 +700,8 @@ class Inbox:
         for e in es:
             e["repo"] = resolve(e["repo"]) or current
             repos.add(e["repo"])
-        for task in self.ch.all_tasks():
+        tasks = self.ch.all_tasks()
+        for task in tasks:
             repo = resolve(task.get("repo") or task.get("worktree"))
             if repo:
                 repos.add(repo)
@@ -391,6 +713,19 @@ class Inbox:
             sel = next((i for i, e in enumerate(es) if e["sid"] == cur["sid"]), sel)
         self.st.update(entries=es, sel=sel, empty=self.ch.L("Nothing tracked yet: N to delegate, or chief.py track <ID>",
                                                          "还没有跟踪任何会话：按 N 委派任务，或 chief.py track <ID>"))
+        # All filesystem/AoE completion loading happens in the refresh job, never
+        # in a key handler. Persisted records include archives and trash.
+        records = getattr(self.ch, "aoe_records", lambda cfg: {})(self.cfg)
+        sessions = {sid: ("trashed" if rec.get("trashed_at") or rec.get("state") in ("trashed", "deleted")
+                          else "archived" if rec.get("archived") or rec.get("state") == "archived" else "live")
+                    for sid, rec in records.items()}
+        for e in es:
+            sessions.setdefault(e["sid"], "live" if e["status"] != "missing" else "archived")
+        decisions = getattr(self.ch, "all_decisions", lambda: [])()
+        self.completions = {"tasks": [t["id"] for t in tasks if t.get("id")],
+                            "task_sessions": [t["session_id"] for t in tasks if t.get("session_id")],
+                            "sessions": sessions,
+                            "decisions": [d["id"] for d in decisions if d.get("state") == "pending"]}
         self.last_refresh = time.time()
 
     def refresh(self):
@@ -635,6 +970,27 @@ class Inbox:
         ch, L, e = self.ch, self.ch.L, self.selected()
         es = self.st["entries"]
         new = self.st.get("new_task")
+        if self.execution and k == "\x1b":
+            self.cancel_command()
+            return True
+        if self.st.get("command_prompt"):
+            if k in ("\n", "\r", "KEY_ENTER"):
+                self.command_answer("")
+                return True
+            elif k in ("e", "n"):
+                self.command_answer(k)
+                return True
+            elif k == "q":
+                self.cancel_command()
+                return False
+            elif k not in ("KEY_NPAGE", "KEY_PPAGE", " "):
+                return True
+        if self.execution and k in (":", "N", "a", "r", "d", "n", "b", "c", "o", "t"):
+            self.st["msg"] = L("command running; Esc cancels", "命令运行中；Esc 取消")
+            return True
+        if k == ":" and not new and not self.execution:
+            self.open_command()
+            return True
         if k == "N":
             if not new and not self.st["busy"]:
                 self.new_intent()
@@ -661,7 +1017,11 @@ class Inbox:
         elif k == "KEY_PPAGE":
             self.st["scroll"] = max(0, self.st["scroll"] - 5)
         elif k == "q":
+            if self.execution:
+                self.cancel_command()
             return False
+        elif k == "\x1b" and self.st.get("command_output") is not None:
+            self.st.pop("command_output", None)
         elif k == "g":
             self.refresh()
         elif k == "t":
@@ -715,6 +1075,13 @@ class Inbox:
 
     def typed(self, k):
         inp = self.st["input"]
+        if inp.get("command"):
+            if k == "\t":
+                self.complete_command()
+                return
+            if k in ("KEY_UP", "KEY_DOWN"):
+                self.history(-1 if k == "KEY_UP" else 1)
+                return
         new = self.st.get("new_task")
         if new and new["phase"] == "intent":
             if k in ("KEY_UP", "KEY_DOWN"):
@@ -769,9 +1136,14 @@ class Inbox:
 
     def answered(self, k):
         c, self.st["confirm"] = self.st["confirm"], None
+        if k == "\x1b" and c.get("command"):
+            self.cancel_command()
+            return
         if k in ("y", "Y"):
             c["then"]()
         else:
+            if c.get("declined_then"):
+                c["declined_then"]()
             self.st["msg"] = c.get("declined") or self.ch.L("cancelled", "已取消")
 
     def open_session(self, scr, e):
@@ -795,6 +1167,9 @@ class Inbox:
         scr.timeout(250)
         self.refresh()
         while True:
+            self.poll_command()
+            if self.command_editor:
+                self.edit_command(scr)
             self.validate_repository()
             now = time.time()
             if (now - self.last_refresh > self.every and not self.st["busy"] and not self.st["input"]

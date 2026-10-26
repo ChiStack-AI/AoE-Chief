@@ -6,6 +6,7 @@ deterministic rules, and drives delegated tasks: executable checks, a decision q
 detection, session rotation and cross-model review. Python 3.7+, standard library only. See README.md.
 """
 import argparse
+import builtins
 from datetime import datetime, timezone
 import fnmatch
 import glob
@@ -19,6 +20,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = Path(os.environ.get("AOE_CHIEF_HOME", str(Path.home()/".local/state/aoe-chief"))).expanduser()
@@ -516,6 +518,8 @@ def run_checks(path, checks, timeout):
         except OSError as e:
             results.append({"cmd": cmd, "ok": False, "code": "oserror", "secs": 0, "tail": str(e)})
             continue
+        if _INBOX_REQUEST is not None:
+            _INBOX_CHECKS[p.pid] = p
         try:
             out, _ = p.communicate(timeout=timeout)
             code = p.returncode
@@ -523,6 +527,8 @@ def run_checks(path, checks, timeout):
             os.killpg(p.pid, signal.SIGKILL)     # also kills pytest workers and other children
             out, _ = p.communicate()
             code = "timeout"
+        finally:
+            _INBOX_CHECKS.pop(p.pid, None)
         results.append({"cmd": cmd, "ok": code == 0, "code": code,
                         "secs": round(time.time()-t0, 1), "tail": (out or "")[-800:]})
     return {"at": now_utc().isoformat(), "cmds": list(checks),
@@ -774,7 +780,7 @@ def confirm_draft(t, yes=False):
                     path = Path(folder)/"contract.json"
                     path.write_text(json.dumps(t, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
                     editor = shlex.split(os.environ.get("EDITOR") or "vi")
-                    if subprocess.call(editor + [str(path)]):
+                    if edit_contract_file(path, editor):
                         raise ValueError("editor exited unsuccessfully")
                     t = validate_draft(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError, TypeError) as e:
@@ -2158,9 +2164,203 @@ def show(cfg, sid, n):
 
 # ---------- CLI ----------
 
-def main():
-    global LANG
-    ap = argparse.ArgumentParser(description=L("AoE Chief: supervise and drive AI coding agents in Agent of Empires",
+CHIEF_COMMANDS = ("tasks", "show", "new", "decide", "nudge", "close", "clean", "track", "untrack", "tick")
+SESSION_COMMANDS = ("show", "start", "stop", "archive", "unarchive", "restore")
+
+
+def command_cheat_sheet():
+    """Shared text for the restricted command bar and the console's user shell."""
+    return [L("chief (optional): ", "chief（可省略）：") + " ".join(CHIEF_COMMANDS),
+            "aoe list · aoe session " + " ".join(SESSION_COMMANDS)]
+
+
+class CommandParser(argparse.ArgumentParser):
+    """Validation without argparse writing to or exiting the curses terminal."""
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+    def error(self, message):
+        raise ValueError(message)
+
+    def add_argument(self, *args, **kwargs):
+        # Validate the entire line even when --help occurs before an invalid
+        # option. The real CLI worker will print the requested help afterwards.
+        if kwargs.get("action") == "help":
+            kwargs["action"] = "store_true"
+        return super().add_argument(*args, **kwargs)
+
+
+def parse_inbox_command(text):
+    """Return (chief|aoe, argv), accepting literals and rejecting shell syntax."""
+    if any(c in text for c in "\n\r\x00"):
+        raise ValueError(L("invalid command: use one line", "命令无效：请使用一行"))
+    quote, escaped = None, False
+    for c in text:
+        if escaped:
+            escaped = False
+        elif c == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c in ";|&<>$`*?[]~":
+            raise ValueError(L("shell operators and expansion are not allowed; quote literal arguments",
+                               "不允许 shell 运算符或展开；字面参数请加引号"))
+    argv = shlex.split(text)
+    if argv[:1] == ["chief"]:
+        argv = argv[1:]
+        if argv[:1] == ["aoe"]:
+            raise ValueError(L("unsupported chief command: aoe", "chief 不支持此命令：aoe"))
+    if not argv:
+        raise ValueError(L("a supported command is required", "请输入支持的命令"))
+    if argv[0] == "aoe":
+        if (len(argv) < 2 or argv[1] not in ("list", "session") or
+                argv[1] == "session" and (len(argv) < 3 or argv[2] not in SESSION_COMMANDS)):
+            raise ValueError(L("unsupported aoe command", "不支持的 aoe 命令"))
+        parser = CommandParser(prog="aoe")
+        sub = parser.add_subparsers(dest="command")
+        sub.required = True
+        sub.add_parser("list").add_argument("--json", action="store_true")
+        session = sub.add_parser("session").add_subparsers(dest="operation")
+        session.required = True
+        for name in SESSION_COMMANDS:
+            sp = session.add_parser(name)
+            sp.add_argument("id")
+            if name == "show":
+                sp.add_argument("--json", action="store_true")
+        target, args = "aoe", argv[1:]
+    else:
+        if argv[0] not in CHIEF_COMMANDS:
+            raise ValueError(L("unsupported command: {}", "不支持的命令：{}").format(argv[0]))
+        target, args, parser = "chief", argv, argument_parser(CommandParser)
+    if "--help" in args or "-h" in args:
+        def help_arguments(node):
+            for action in node._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for child in action.choices.values():
+                        help_arguments(child)
+                elif not action.option_strings:
+                    action.required = False
+                    if action.nargs is None:
+                        action.nargs = "?"
+                    elif action.nargs == "+":
+                        action.nargs = "*"
+        help_arguments(parser)
+    parser.parse_args(args)
+    return target, args
+
+
+def console(cfg, every=15, layout="left-right", shell_cwd="~"):
+    tmux = shutil.which("tmux")
+    if not tmux:
+        raise RuntimeError(L("tmux not found; install tmux to use chief console",
+                             "未找到 tmux；使用 chief console 前请安装 tmux"))
+    directory = os.path.abspath(os.path.expanduser(shell_cwd))
+    if not os.path.isdir(directory):
+        raise RuntimeError(L("shell directory not found: {}", "Shell 目录不存在：{}").format(directory))
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    shell = os.path.abspath(shell) if os.sep in shell else shutil.which(shell)
+    if not shell or not os.path.isfile(shell) or not os.access(shell, os.X_OK):
+        raise RuntimeError(L("interactive shell not found or not executable; check SHELL",
+                             "交互 shell 不存在或不可执行；请检查 SHELL"))
+    sheet = "\n".join(command_cheat_sheet())
+    shell_command = "printf '%s\\n' " + shlex.quote(sheet) + "; exec " + shlex.quote(shell) + " -i"
+    direction = "-h" if layout == "left-right" else "-v"
+    if os.environ.get("TMUX"):
+        pane = os.environ.get("TMUX_PANE") or call([tmux, "display-message", "-p", "#{pane_id}"]).strip()
+        call([tmux, "split-window", direction, "-d", "-t", pane, "-c", directory, shell_command])
+        import chief_tui
+        return chief_tui.run(cfg, sys.modules[__name__], every)
+    name = "chief-console-{}".format(os.getpid())
+    inbox = " ".join(shlex.quote(x) for x in
+                     [sys.executable, str(Path(__file__).resolve()), "inbox", "--every", str(every)])
+    window = call([tmux, "new-session", "-d", "-s", name, "-P", "-F", "#{window_id}",
+                   "-c", os.getcwd(), inbox]).strip()
+    try:
+        call([tmux, "split-window", direction, "-d", "-t", window, "-c", directory, shell_command])
+    except (RuntimeError, OSError):
+        try:
+            call([tmux, "kill-session", "-t", name])
+        except (RuntimeError, OSError):
+            pass
+        raise
+    status = subprocess.call([tmux, "attach-session", "-t", name])
+    if status:
+        raise RuntimeError(L("tmux attach failed (exit {})", "tmux 连接失败（退出码 {}）").format(status))
+    return 0
+
+
+# Only the owned inbox worker installs this hook. Ordinary CLI prompts/editors
+# retain their existing behavior; curses receives explicit requests over pipes.
+_INBOX_REQUEST = None
+_INBOX_CHECKS = {}
+
+
+def edit_contract_file(path, editor):
+    if _INBOX_REQUEST is not None:
+        return _INBOX_REQUEST("editor", {"path": str(path), "argv": editor})
+    return subprocess.call(editor + [str(path)])
+
+
+def inbox_worker(argv):
+    """Execute the existing CLI with framed output and UI-mediated input."""
+    global _INBOX_REQUEST
+    sink = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1, encoding="utf-8")
+    lock = threading.Lock()
+
+    def send(kind, data):
+        with lock:
+            sink.write(json.dumps({"kind": kind, "data": data}) + "\n")
+            sink.flush()
+
+    class Output:
+        encoding = "utf-8"
+
+        def __init__(self, channel):
+            self.channel = channel
+
+        def write(self, text):
+            if text:
+                send(self.channel, text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+    def request(kind, data):
+        send(kind, data)
+        answer = sys.stdin.readline()
+        if not answer:
+            raise EOFError()
+        return json.loads(answer)
+
+    sys.stdout, sys.stderr = Output("stdout"), Output("stderr")
+    builtins.input = lambda prompt="": request("prompt", {"text": prompt, "contract": argv[0] == "new"})
+    _INBOX_REQUEST = request
+
+    def terminate(signum, frame):
+        # Checks own separate process groups for their normal timeout handling.
+        # They still belong to this execution and must stop on inbox cancellation.
+        for pid, process in list(_INBOX_CHECKS.items()):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                process.wait(timeout=0.1)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    return main(argv)
+
+
+def argument_parser(parser_class=argparse.ArgumentParser):
+    ap = parser_class(description=L("AoE Chief: supervise and drive AI coding agents in Agent of Empires",
                                                "AoE Chief：监督并推进 Agent of Empires 里的 AI 编程 Agent"))
     sub = ap.add_subparsers(dest="command")
     sub.required = True
@@ -2295,14 +2495,38 @@ def main():
     en = sub.add_parser("engine", help=L("show or set the default AI engine and list the models per level",
                                          "查看或设置默认 AI 引擎，并列出各档位模型"))
     en.add_argument("name", nargs="?", choices=["codex", "claude"])
-    ib = sub.add_parser("inbox", help=L("interactive terminal inbox: what needs you, one key per action",
-                                        "终端交互收件箱：需要你的事项，一键处理"))
+    inbox_help = L("Interactive inbox. ':' opens a restricted command bar (optional chief prefix; aoe list or "
+                   "aoe session show/start/stop/archive/unarchive/restore). Tab completes commands and IDs; "
+                   "Up/Down recalls history. Enter runs in the background. Esc cancels an owned command process; "
+                   "completed side effects are not undone. Close, clean, stop and archive require y/N confirmation. "
+                   "Output stays in the scrollable detail pane. Use chief console for an interactive shell.",
+                   "交互收件箱。':' 打开受限命令栏（chief 前缀可省略；支持 aoe list 及指定 session 命令）。"
+                   "Tab 补全命令和 ID，↑↓ 浏览历史，Enter 后台运行，Esc 终止命令进程（已完成操作不会撤销）。"
+                   "关闭、清理、停止和归档需要 y/N 确认。输出保留在可滚动详情中；交互 shell 请用 chief console。")
+    ib = sub.add_parser("inbox", help=L("interactive inbox with ':' commands", "交互收件箱，支持 ':' 命令"),
+                        description=inbox_help)
     ib.add_argument("--every", type=int, default=15, help=L("refresh interval in seconds (default 15; checks never run here)",
                                                             "刷新间隔秒数（默认 15；这里从不运行检查）"))
     sh = sub.add_parser("show", help=L("drill into a session or task", "展开某个 Session 或任务"))
     sh.add_argument("id")
     sh.add_argument("--turns", type=int, default=3)
-    args = ap.parse_args()
+    co = sub.add_parser("console", help=L("tmux inbox and interactive user shell", "tmux 收件箱与交互 shell"),
+                        description=L("Split inbox left and interactive shell right by default. Inside tmux use the "
+                                      "current window/pane; outside create and attach a session. Shell directory defaults "
+                                      "to home (~). Optionally place inbox top and shell bottom.",
+                                      "默认左侧收件箱、右侧交互 shell。tmux 内拆分当前窗口；外部创建并连接会话。"
+                                      "shell 目录默认为家目录 (~)，可选上方收件箱、下方 shell。"))
+    co.add_argument("--layout", choices=["left-right", "top-bottom"], default="left-right",
+                    help=L("pane layout (default: left-right)", "布局（默认 left-right）"))
+    co.add_argument("--shell-cwd", default="~", metavar="PATH",
+                    help=L("shell working directory (default: home ~)", "shell 工作目录（默认家目录 ~）"))
+    co.add_argument("--every", type=int, default=15, help=L("inbox refresh interval", "收件箱刷新间隔"))
+    return ap
+
+
+def main(argv=None):
+    global LANG
+    args = argument_parser().parse_args(argv)
     try:
         cfg = load_json(CFG, {"profile": "main"}) if args.command == "clean" else config()
         if args.command == "init":
@@ -2568,6 +2792,8 @@ def main():
         elif args.command == "inbox":
             import chief_tui
             return chief_tui.run(cfg, sys.modules[__name__], args.every)
+        elif args.command == "console":
+            return console(cfg, args.every, args.layout, args.shell_cwd)
         elif args.command == "show":
             sid = resolve_sid(cfg, args.id)
             print(show(cfg, sid, args.turns))
@@ -2598,4 +2824,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(inbox_worker(sys.argv[2:]) if sys.argv[1:2] == ["_inbox_worker"] else main())
