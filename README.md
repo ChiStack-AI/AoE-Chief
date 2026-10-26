@@ -279,6 +279,26 @@ tracked session), `d` dismiss the decision, `n` send the worker guidance, `b` se
 background, so the inbox stays responsive. It refreshes every 15 seconds and never runs checks; `watch` does the
 driving.
 
+Press `?` to open a one-line **AI question box**, including on an empty board. Type a nonempty question and press
+`Enter` to submit it to your configured engine/model. The detail pane shows **thinking** while generation runs in
+the background; Up/Down navigation stays responsive. `Esc` dismisses an unsubmitted question or cancels active
+generation, terminating its owned process and descendants and discarding late results. Recent questions and
+answers remain available in this Inbox across refreshes and selection changes; `PgUp`/`PgDn` scroll them.
+After an answer, Esc returns to task details; `?` opens the question history again. History is kept for the latest
+12 questions in this Inbox and is not saved between launches.
+
+The assistant is instructed to use your language, put the conclusion first and give at most three supporting points. It gets
+explicit README/architecture documentation, the current board, pending decisions, recent events and review cards,
+redacted with Chief's existing secret masker and enclosed as untrusted data. Generation uses `read_files=False`;
+repository text and prior model answers cannot authorize actions or change Chief's rules.
+
+When useful, an answer offers numbered **command suggestions**, checked against the existing command parser.
+Press `1`–`9` to select a suggestion and **prefill** the `:` command bar. You can edit it or cancel with Esc;
+only `Enter` submits the edited command, which is validated again. `close`, `clean`, `aoe session stop` and
+`aoe session archive` retain their `y/N` confirmations. Asking, receiving an answer and selecting a suggestion
+never execute commands, approve acceptance tests, resolve decisions or send replies. Unavailable engines,
+timeouts, failed generation and unusable responses show localized errors; press `?` and submit again to retry.
+
 After `c` successfully closes and archives a task, a second `(y/N)` confirmation offers to clean that task's
 session and worktree. Enter, `n` or Esc keeps it archived. Accepting preserves progress, checks cleanliness
 again and keeps the branch. A cleanup failure leaves the task closed and shows how to inspect or retry it.

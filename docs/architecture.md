@@ -134,6 +134,16 @@ Loop rules:
 - `chief inbox` is the interactive form of the same triage: a curses list with one key per action. It runs the
   same pass as the brief without checks, every 15 seconds, and sends in a background thread. Automation stays in
   `watch`, so closing the inbox never stops a task.
+- `?` opens a question input. An owned worker calls `pick_model` and `generate_ai(read_files=False)` with
+  explicit README/architecture documentation, a board snapshot including draft tasks, pending decisions,
+  recent events and review cards. All evidence and recent conversation are redacted and encoded in a single
+  untrusted JSON boundary; source delimiters are escaped. The worker emits answer data or a localized error,
+  never command, editor, acceptance, decision or reply requests. Navigation and scrolling remain on the UI thread.
+- The UI admits suggested commands only through `parse_inbox_command`. Keys `1`–`9` prefill `:` without submitting;
+  the existing Enter handler parses edited input again and retains all `y/N` guards. Questions alone have no
+  authority to act. Esc detaches the request before killing its owned process group, including descendants;
+  late events cannot update a newer request. A deadline bounds the whole AI process tree. The last 12 question
+  turns stay in memory across board refreshes and selection changes; PgUp/PgDn scroll them.
 - Each board task's level is mirrored onto its AoE color dot (red: needs you, amber: working, green: to accept),
   so the AoE dashboard shows it too. Chief calls AoE only when the color changes.
 - Both the inbox and `watch` can run as standing AoE sessions (custom agents), so tasks keep moving when no

@@ -2305,6 +2305,79 @@ def edit_contract_file(path, editor):
     return subprocess.call(editor + [str(path)])
 
 
+def inbox_ai_response(value):
+    """Decode data only. Model text can never become an Inbox protocol request."""
+    if isinstance(value, str):
+        if len(value) > 65536:
+            raise ValueError("AI response is too long")
+        value = json.loads(value)
+    if (not isinstance(value, dict) or not isinstance(value.get("answer"), str) or
+            not value["answer"].strip() or not isinstance(value.get("suggestions", []), list) or
+            len(value.get("suggestions", [])) > 9 or
+            any(not isinstance(s, str) for s in value.get("suggestions", []))):
+        raise ValueError("invalid AI response")
+    answer = redact("".join(c for c in value["answer"] if c in "\n\t" or c.isprintable())).strip()
+    if not answer:
+        raise ValueError("empty AI response")
+    return {"answer": answer, "suggestions": [redact(s) for s in value.get("suggestions", [])]}
+
+
+def inbox_ai_error(exc):
+    """Classify wrapped generate_ai/call errors without exposing engine output as UI requests."""
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, subprocess.TimeoutExpired):
+            return "timeout"
+        if isinstance(cause, FileNotFoundError):
+            return "unavailable"
+        cause = cause.__cause__
+    text = str(exc).lower()
+    if "empty answer" in text or "空内容" in text:
+        return "unusable"
+    return "failed"
+
+
+def inbox_ai_worker():
+    """One read-only generation in an owned process group; stdin is JSON, never CLI text."""
+    global LANG
+
+    def send(kind, data):
+        print(json.dumps({"kind": kind, "data": data}), flush=True)
+
+    def expired(signum, frame):
+        # subprocess.run's timeout can still wait on inherited pipes held by
+        # descendants. The worker owns this group, so bound the entire tree.
+        send("ai_error", "timeout")
+        if os.getpgrp() == os.getpid():
+            os.killpg(os.getpid(), signal.SIGKILL)
+        raise subprocess.TimeoutExpired("AI worker", 300)
+
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        request = json.loads(sys.stdin.readline())
+        LANG = request["lang"]
+        cfg, engine = request["cfg"], request["cfg"].get("engine", "codex")
+        if engine not in DEFAULT_MODELS:
+            send("ai_error", "unavailable")
+            return 1
+        timeout = 180 if engine == "claude" else 300
+        signal.alarm(timeout + 1)
+        output = generate_ai(request["prompt"], engine, pick_model(cfg, engine, 2),
+                             read_files=False, timeout=timeout)
+    except Exception as exc:
+        send("ai_error", inbox_ai_error(exc))
+        return 1
+    finally:
+        signal.alarm(0)
+    try:
+        response = inbox_ai_response(output)
+    except (ValueError, TypeError):
+        send("ai_error", "unusable")
+        return 1
+    send("answer", response)
+    return 0
+
+
 def inbox_worker(argv):
     """Execute the existing CLI with framed output and UI-mediated input."""
     global _INBOX_REQUEST
@@ -2495,12 +2568,22 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     en = sub.add_parser("engine", help=L("show or set the default AI engine and list the models per level",
                                          "查看或设置默认 AI 引擎，并列出各档位模型"))
     en.add_argument("name", nargs="?", choices=["codex", "claude"])
-    inbox_help = L("Interactive inbox. ':' opens a restricted command bar (optional chief prefix; aoe list or "
+    inbox_help = L("Interactive inbox. '?' opens a one-line AI question box; Enter submits a nonempty question. "
+                   "Thinking runs in the background with responsive navigation. Esc cancels input or AI generation "
+                   "and its owned process tree; late results are discarded. PgUp/PgDn scroll recent questions and "
+                   "answers across refreshes and selection changes. Keys 1-9 select a validated suggestion to prefill "
+                   "the ':' bar: edit it, then Enter submits; selection never executes. AI unavailable, timeout, "
+                   "failed generation or unusable responses show errors; press ? to retry. "
+                   "':' opens a restricted command bar (optional chief prefix; aoe list or "
                    "aoe session show/start/stop/archive/unarchive/restore). Tab completes commands and IDs; "
                    "Up/Down recalls history. Enter runs in the background. Esc cancels an owned command process; "
                    "completed side effects are not undone. Close, clean, stop and archive require y/N confirmation. "
                    "Output stays in the scrollable detail pane. Use chief console for an interactive shell.",
-                   "交互收件箱。':' 打开受限命令栏（chief 前缀可省略；支持 aoe list 及指定 session 命令）。"
+                   "交互收件箱。'?' 打开一行 AI 提问框，Enter 提交非空问题。后台思考时仍可选择会话；"
+                   "Esc 取消输入或 AI 生成并终止所属进程树，丢弃过期结果。PgUp/PgDn 滚动最近问答，刷新和切换选择后保留。"
+                   "1-9 选择验证过的命令建议，预填 ':' 命令栏；可编辑，必须 Enter 才提交，选择不会执行。"
+                   "AI 不可用、超时、生成失败或回答无效会显示错误；按 ? 重新提交以重试。"
+                   "':' 打开受限命令栏（chief 前缀可省略；支持 aoe list 及指定 session 命令）。"
                    "Tab 补全命令和 ID，↑↓ 浏览历史，Enter 后台运行，Esc 终止命令进程（已完成操作不会撤销）。"
                    "关闭、清理、停止和归档需要 y/N 确认。输出保留在可滚动详情中；交互 shell 请用 chief console。")
     ib = sub.add_parser("inbox", help=L("interactive inbox with ':' commands", "交互收件箱，支持 ':' 命令"),
@@ -2824,4 +2907,5 @@ def main(argv=None):
     return 0
 
 if __name__ == "__main__":
-    sys.exit(inbox_worker(sys.argv[2:]) if sys.argv[1:2] == ["_inbox_worker"] else main())
+    sys.exit(inbox_ai_worker() if sys.argv[1:2] == ["_inbox_ai_worker"] else
+             inbox_worker(sys.argv[2:]) if sys.argv[1:2] == ["_inbox_worker"] else main())
