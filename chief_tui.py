@@ -466,11 +466,7 @@ def question_request(ch, cfg, question, result, history, lang):
     data = json.dumps(redact(context), ensure_ascii=False)
     # Source text cannot close its data boundary, including a hostile question/history.
     data = data.replace("<", "\\u003c").replace(">", "\\u003e")
-    parser = ch.argument_parser(ch.CommandParser)
-    sub = next(a for a in parser._actions if isinstance(getattr(a, "choices", None), dict))
-    commands = "\n".join(sub.choices[name].format_help() for name in ch.CHIEF_COMMANDS)
-    commands += "\naoe list [--json]\naoe session show <ID> [--json]\n" + "\n".join(
-        "aoe session {} <ID>".format(name) for name in ch.SESSION_COMMANDS if name != "show")
+    commands = ch.inbox_command_help(lang)
     prompt = """You are the Inbox question assistant for AoE Chief. Explain the user's question using the evidence.
 Answer in {language}; follow the user's question language when clear. Put the conclusion first, with at most three
 supporting points. Distinguish evidence from claims and say when information is missing.
@@ -595,6 +591,89 @@ class CommandExecution:
         process.wait()
 
 
+class QuestionExecution(CommandExecution):
+    """Run the existing AI generator on a thread, owning its worker process.
+
+    Unlike CLI commands, generation needs no worker-side terminal/input protocol.
+    A small supervisor owns the engine without reloading Chief or a JSON hop.
+    """
+    def __init__(self, ch, request):
+        super().__init__([], request=request)
+        self.ch = ch
+
+    def run_process(self, argv, input_text, timeout, cwd):
+        if self.cancelled.is_set():
+            raise RuntimeError("cancelled")
+        # Preserve missing-engine errors before the supervisor turns launch
+        # failures into exit statuses. generate_ai supplies a resolved binary.
+        os.stat(argv[0] if os.path.isabs(argv[0]) else os.path.join(cwd or os.getcwd(), argv[0]))
+        # A fixed POSIX supervisor avoids another Python startup, while keeping
+        # a distinct owner for the engine tree. All engine arguments are literal
+        # positional parameters, never shell source. fd 3 preserves stdin for
+        # the background child; both processes close that extra descriptor.
+        supervisor = 'exec 3<&0; "$@" <&3 3<&- & child=$!; exec 3<&-; wait "$child"'
+        command = ["/bin/sh", "-c", supervisor, str(Path(self.ch.__file__).resolve())] + list(argv)
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, universal_newlines=True,
+                                        cwd=cwd, start_new_session=True)
+        try:
+            # Cancellation may have arrived while Popen was still launching.
+            if self.cancelled.is_set():
+                raise RuntimeError("cancelled")
+            stdout, stderr = self.process.communicate(input_text, timeout=timeout)
+            return subprocess.CompletedProcess(argv, self.process.returncode, stdout, stderr)
+        finally:
+            # Timeout/cancellation kills inherited pipe holders as well as the
+            # engine; even a successful engine must not leave descendants alive.
+            self.stop()
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if stream:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass  # A cancelled engine may already have closed its input.
+
+    def run(self):
+        code = 1
+        try:
+            if self.cancelled.is_set():
+                return
+            request = self.request()
+            if self.cancelled.is_set():
+                return
+            cfg = request["cfg"]
+            engine = cfg.get("engine", "codex")
+            if engine not in self.ch.DEFAULT_MODELS:
+                self.events.put(("ai_error", "unavailable"))
+                return
+            output = self.ch.generate_ai(request["prompt"], engine, self.ch.pick_model(cfg, engine, 2),
+                read_files=False, timeout=180 if engine == "claude" else 300, process_owner=self)
+            try:
+                response = self.ch.inbox_ai_response(output)
+            except (ValueError, TypeError):
+                self.events.put(("ai_error", "unusable"))
+                return
+            self.events.put(("answer", response))
+            code = 0
+        except Exception as exc:
+            self.events.put(("ai_error", self.ch.inbox_ai_error(exc)))
+        finally:
+            self.events.put(("done", code))
+            self.finished.set()
+
+
+def worker_command(ch, mode, args=()):
+    """Import the worker through Python's validated bytecode cache.
+
+    Running the large source file directly recompiles it on every command or
+    question. run_module keeps the same CLI entry point, interpreter, site hooks
+    and process ownership, and automatically rebuilds stale/missing bytecode.
+    """
+    loader = ("import os,runpy,sys; sys.path.insert(0,os.path.dirname(sys.argv[1])); "
+              "sys.argv=sys.argv[1:]; runpy.run_module('chief',run_name='__main__',alter_sys=True)")
+    return [sys.executable, "-c", loader, str(Path(ch.__file__).resolve()), mode] + list(args)
+
+
 class Inbox:
     def __init__(self, cfg, ch, every):
         self.cfg, self.ch, self.every = cfg, ch, max(5, every)
@@ -654,8 +733,8 @@ class Inbox:
             turn["error"] = self.st["msg"]
             return
         cfg, result, lang = copy.deepcopy(self.cfg), copy.deepcopy(self.board_result), self.ch.LANG
-        execution = CommandExecution([sys.executable, str(Path(self.ch.__file__).resolve()), "_inbox_ai_worker"],
-            protocol=True, request=lambda: question_request(self.ch, cfg, text, result, recent, lang))
+        execution = QuestionExecution(self.ch,
+            request=lambda: question_request(self.ch, cfg, text, result, recent, lang))
         execution.turn, execution.response, execution.ai_error = turn, None, None
         self.ai_execution = execution
         self.st.update(ai_thinking=True, scroll=10 ** 9,
@@ -763,7 +842,7 @@ class Inbox:
                                       "错误：忙；当前操作完成后请重试。")
             return
         try:
-            command = ([sys.executable, str(Path(self.ch.__file__).resolve()), "_inbox_worker"] + argv
+            command = (worker_command(self.ch, "_inbox_worker", argv)
                        if target == "chief" else [self.ch.aoe_bin(), "-p", self.cfg["profile"]] + argv)
             self.execution = CommandExecution(command, protocol=target == "chief")
             self.execution.turn = turn
@@ -900,7 +979,7 @@ class Inbox:
             name = args[0]
             # Count positional arguments, excluding option values, so a task ID
             # also completes after flags such as show --turns 5 <ID>.
-            parser = ch.argument_parser(ch.CommandParser)
+            parser = ch.inbox_parser(ch.LANG)
             sub = next(a for a in parser._actions if hasattr(a, "choices") and isinstance(a.choices, dict))
             command_parser = sub.choices.get(name)
             position, expecting, options = 0, False, True
@@ -1493,6 +1572,14 @@ class Inbox:
         scr.clear()
         self.st["msg"] = L("back from {}", "已从 {} 返回").format(e["title"])
 
+    def input_timeout(self):
+        """Deliver background results promptly, without spinning while idle."""
+        new = self.st.get("new_task")
+        if (self.st["busy"] or self.execution or self.ai_execution or self.cancelled_commands
+                or new and new["phase"] == "intent" and new["repo_status"] == "pending"):
+            return 10
+        return 250
+
     def loop(self, scr):
         styles = setup_colors()
         curses.curs_set(0)
@@ -1511,8 +1598,7 @@ class Inbox:
             self.st.update(now=now, clock=datetime.now().strftime("%H:%M"), tick_note=self.tick_note())
             h, w = scr.getmaxyx()
             draw(scr, render(self.ch, self.st, w, h), styles, w, h)
-            new = self.st.get("new_task")
-            scr.timeout(50 if new and new["phase"] == "intent" and new["repo_status"] == "pending" else 250)
+            scr.timeout(self.input_timeout())
             try:
                 k = scr.get_wch()
             except curses.error:
@@ -1547,7 +1633,7 @@ class Inbox:
                     except curses.error:
                         break
             finally:
-                scr.timeout(250)
+                scr.timeout(self.input_timeout())
 
 def setup_colors():
     s = {"text": curses.A_NORMAL, "title": curses.A_BOLD, "dim": curses.A_DIM, "info": curses.A_DIM,

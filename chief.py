@@ -9,6 +9,7 @@ import argparse
 import builtins
 from datetime import datetime, timezone
 import fnmatch
+from functools import lru_cache
 import glob
 import json
 import os
@@ -133,10 +134,13 @@ def aoe_bin():
         return str(local)
     return shutil.which("aoe") or "aoe"
 
-def call(args, timeout=25, input_text=None, cwd=None):
+def call(args, timeout=25, input_text=None, cwd=None, process_owner=None):
     try:
-        p = subprocess.run(args, input=input_text, universal_newlines=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=timeout, cwd=cwd)
+        if process_owner is not None:
+            p = process_owner.run_process(args, input_text, timeout, cwd)
+        else:
+            p = subprocess.run(args, input=input_text, universal_newlines=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=timeout, cwd=cwd)
     except (subprocess.TimeoutExpired, OSError) as e:
         raise RuntimeError(L("could not run {}: {}", "执行失败：{}：{}").format(args[0], e)) from e
     if p.returncode:
@@ -569,40 +573,76 @@ def scope_changes(diff):
             changes[source] = status[0]
     return changes, renamed
 
+@lru_cache(maxsize=1)
+def scope_executor():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="chief-scope")
+
+
+@lru_cache(maxsize=16)
+def scope_tree(top, commit):
+    """Only immutable, resolved Git objects are cached; never working-tree state."""
+    return call(["git", "-C", top, "ls-tree", "-r", "-z", commit, "--"], timeout=15)
+
+
+@lru_cache(maxsize=16)
+def scope_committed_diff(top, base, head):
+    if base == head:
+        return ""
+    return call(["git", "-C", top, "diff", "--name-status", "-z", "--find-renames",
+                 base, head, "--"], timeout=15)
+
+
 def scope_info(path, task, extra_ignore=()):
     """Scope/protection since base; acceptance tests may change during the test phase."""
     scope, protected = task.get("scope"), task.get("protected") or []
     testing = in_test_phase(task)
     if not path or not (scope or protected or testing):
         return None
+    pending = []
     try:
-        top = call(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=8).strip()
-        diff = call(["git", "-C", top, "diff", "--name-status", "-z", "--find-renames",
-                     task.get("base") or "HEAD", "--"], timeout=15)
+        top, head = call(["git", "-C", path, "rev-parse", "--show-toplevel", "HEAD"], timeout=8).strip().rsplit("\n", 1)
+        base = task.get("base") or "HEAD"
+        if base == "HEAD":
+            base = head
+        elif not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", base):
+            base = call(["git", "-C", top, "rev-parse", "--verify", base], timeout=8).strip()
+        # Independent, read-only scans can overlap. Working tree, index and
+        # untracked files are still inspected afresh for every scope check.
+        executor = scope_executor()
+        working = executor.submit(call, ["git", "-C", top, "diff", "--name-status", "-z", "--find-renames",
+                                        base, "--"], timeout=15)
         # Include index-only changes even when an unstaged edit reverses them
         # on disk; those staged contents can still be committed by the worker.
-        diff += call(["git", "-C", top, "diff", "--cached", "--name-status", "-z", "--find-renames",
-                      task.get("base") or "HEAD", "--"], timeout=15)
+        staged = executor.submit(call, ["git", "-C", top, "diff", "--cached", "--name-status", "-z", "--find-renames",
+                                       base, "--"], timeout=15)
+        others = executor.submit(call, ["git", "-C", top, "ls-files", "-z", "--others", "--exclude-standard"], timeout=15)
+        pending = [working, staged, others]
+        if testing:
+            tree_job = executor.submit(scope_tree, top, base)
+            committed_job = executor.submit(scope_committed_diff, top, base, head)
+            pending.extend((tree_job, committed_job))
+        diff = working.result() + staged.result()
         changes, renamed = scope_changes(diff)
-        untracked = call(["git", "-C", top, "ls-files", "-z", "--others", "--exclude-standard"], timeout=15)
+        untracked = others.result()
         for name in untracked.split("\0"):
             if name:
                 changes.setdefault(name, "A")
         baseline, committed_support = {}, set()
         if testing:
-            tree = call(["git", "-C", top, "ls-tree", "-r", "-z", task.get("base") or "HEAD", "--"], timeout=15)
+            tree = tree_job.result()
             for entry in tree.split("\0"):
                 if entry:
                     metadata, name = entry.split("\t", 1)
                     baseline[name] = metadata.split()[2]
             # A newly committed helper may have been removed from both the
             # working tree and index. It must still be validated against HEAD.
-            committed, moved = scope_changes(call(
-                ["git", "-C", top, "diff", "--name-status", "-z", "--find-renames",
-                 task.get("base") or "HEAD", "HEAD", "--"], timeout=15))
+            committed, moved = scope_changes(committed_job.result())
             renamed.update(moved)
             committed_support = {n for n, status in committed.items() if status == "A" and not is_test_file(n)}
     except (RuntimeError, ValueError, StopIteration):
+        for future in pending:
+            future.cancel()
         return None
     pats = SCOPE_IGNORE + list(extra_ignore)
     files = {os.path.join(top, n): status for n, status in changes.items() if n and not ignored(n, pats)}
@@ -2209,7 +2249,7 @@ def pick_model(cfg, engine, level, model=None, effort=None):
         spec["effort"] = effort
     return spec
 
-def generate_ai(prompt, engine, spec, cwd=None, read_files=False, timeout=None):
+def generate_ai(prompt, engine, spec, cwd=None, read_files=False, timeout=None, process_owner=None):
     """With read_files=True the model may read files in cwd (for reviews); otherwise it gets no tools at all."""
     cwd = cwd or str(ROOT)
     if engine == "claude":
@@ -2220,7 +2260,8 @@ def generate_ai(prompt, engine, spec, cwd=None, read_files=False, timeout=None):
             cmd += ["--model", spec["model"]]
         if spec.get("effort"):
             cmd += ["--effort", spec["effort"]]
-        output = call(cmd, timeout=timeout or 180, input_text=prompt, cwd=cwd)
+        output = call(cmd, timeout=timeout or 180, input_text=prompt, cwd=cwd,
+                      **({"process_owner": process_owner} if process_owner is not None else {}))
     else:
         binary = shutil.which("codex") or str(Path.home()/".npm-global/bin/codex")
         cmd = [binary, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check"]
@@ -2228,7 +2269,8 @@ def generate_ai(prompt, engine, spec, cwd=None, read_files=False, timeout=None):
             cmd += ["-m", spec["model"]]
         if spec.get("effort"):
             cmd += ["-c", "model_reasoning_effort=" + json.dumps(spec["effort"])]
-        output = call(cmd + ["-"], timeout=timeout or 300, input_text=prompt, cwd=cwd)
+        output = call(cmd + ["-"], timeout=timeout or 300, input_text=prompt, cwd=cwd,
+                      **({"process_owner": process_owner} if process_owner is not None else {}))
     if not output.strip():
         raise RuntimeError(L("the AI returned an empty answer", "AI 返回了空内容"))
     return output.strip()+"\n"
@@ -2307,6 +2349,53 @@ class CommandParser(argparse.ArgumentParser):
         return super().add_argument(*args, **kwargs)
 
 
+@lru_cache(maxsize=8)
+def inbox_parser(language, target="chief", help_requested=False):
+    """Reuse immutable parser definitions; help has its own relaxed copy.
+
+    The language is part of the key because definitions contain localized help.
+    parse_args creates a fresh Namespace, so no command's values are retained.
+    """
+    if target == "chief":
+        parser = argument_parser(CommandParser)
+    else:
+        parser = CommandParser(prog="aoe")
+        sub = parser.add_subparsers(dest="command")
+        sub.required = True
+        sub.add_parser("list").add_argument("--json", action="store_true")
+        session = sub.add_parser("session").add_subparsers(dest="operation")
+        session.required = True
+        for name in SESSION_COMMANDS:
+            sp = session.add_parser(name)
+            sp.add_argument("id")
+            if name == "show":
+                sp.add_argument("--json", action="store_true")
+    if help_requested:
+        def help_arguments(node):
+            for action in node._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for child in action.choices.values():
+                        help_arguments(child)
+                elif not action.option_strings:
+                    action.required = False
+                    if action.nargs is None:
+                        action.nargs = "?"
+                    elif action.nargs == "+":
+                        action.nargs = "*"
+        help_arguments(parser)
+    return parser
+
+
+@lru_cache(maxsize=2)
+def inbox_command_help(language):
+    parser = inbox_parser(language)
+    sub = next(a for a in parser._actions if isinstance(getattr(a, "choices", None), dict))
+    commands = "\n".join(sub.choices[name].format_help() for name in CHIEF_COMMANDS)
+    commands += "\naoe list [--json]\naoe session show <ID> [--json]\n" + "\n".join(
+        "aoe session {} <ID>".format(name) for name in SESSION_COMMANDS if name != "show")
+    return commands
+
+
 def parse_inbox_command(text):
     """Return (chief|aoe, argv), accepting literals and rejecting shell syntax."""
     if any(c in text for c in "\n\r\x00"):
@@ -2336,35 +2425,12 @@ def parse_inbox_command(text):
         if (len(argv) < 2 or argv[1] not in ("list", "session") or
                 argv[1] == "session" and (len(argv) < 3 or argv[2] not in SESSION_COMMANDS)):
             raise ValueError(L("unsupported aoe command", "不支持的 aoe 命令"))
-        parser = CommandParser(prog="aoe")
-        sub = parser.add_subparsers(dest="command")
-        sub.required = True
-        sub.add_parser("list").add_argument("--json", action="store_true")
-        session = sub.add_parser("session").add_subparsers(dest="operation")
-        session.required = True
-        for name in SESSION_COMMANDS:
-            sp = session.add_parser(name)
-            sp.add_argument("id")
-            if name == "show":
-                sp.add_argument("--json", action="store_true")
         target, args = "aoe", argv[1:]
     else:
         if argv[0] not in CHIEF_COMMANDS:
             raise ValueError(L("unsupported command: {}", "不支持的命令：{}").format(argv[0]))
-        target, args, parser = "chief", argv, argument_parser(CommandParser)
-    if "--help" in args or "-h" in args:
-        def help_arguments(node):
-            for action in node._actions:
-                if isinstance(action, argparse._SubParsersAction):
-                    for child in action.choices.values():
-                        help_arguments(child)
-                elif not action.option_strings:
-                    action.required = False
-                    if action.nargs is None:
-                        action.nargs = "?"
-                    elif action.nargs == "+":
-                        action.nargs = "*"
-        help_arguments(parser)
+        target, args = "chief", argv
+    parser = inbox_parser(LANG, target, "--help" in args or "-h" in args)
     parser.parse_args(args)
     return target, args
 
@@ -2548,21 +2614,36 @@ def inbox_worker(argv):
     return main(argv)
 
 
-def argument_parser(parser_class=argparse.ArgumentParser):
+def argument_parser(parser_class=argparse.ArgumentParser, selected=None):
     ap = parser_class(description=L("AoE Chief: supervise and drive AI coding agents in Agent of Empires",
                                                "AoE Chief：监督并推进 Agent of Empires 里的 AI 编程 Agent"))
     sub = ap.add_subparsers(dest="command")
     sub.required = True
-    sub.add_parser("init", help=L("create the config and state directory", "初始化配置与数据目录"))
-    lg = sub.add_parser("lang", help=L("show or set the output language", "查看或设置输出语言"))
+
+    class UnusedArguments:
+        def add_argument(self, *args, **kwargs):
+            pass
+
+        def add_mutually_exclusive_group(self, **kwargs):
+            return self
+
+    unused = UnusedArguments()
+
+    def command(name, **kwargs):
+        if selected is None or name == selected:
+            return sub.add_parser(name, **kwargs)
+        return unused
+
+    command("init", help=L("create the config and state directory", "初始化配置与数据目录"))
+    lg = command("lang", help=L("show or set the output language", "查看或设置输出语言"))
     lg.add_argument("name", nargs="?", choices=["en", "zh"])
-    sp = sub.add_parser("sessions", help=L("list terminal sessions you can track", "列出可跟踪的 Terminal Session"))
+    sp = command("sessions", help=L("list terminal sessions you can track", "列出可跟踪的 Terminal Session"))
     sp.add_argument("--all", action="store_true", help=L("also show structured / deleted sessions", "也显示 structured/已删除的"))
-    tr = sub.add_parser("track", help=L("watch sessions (never starts or changes them)", "跟踪 Session（不会启动或修改它）"))
+    tr = command("track", help=L("watch sessions (never starts or changes them)", "跟踪 Session（不会启动或修改它）"))
     tr.add_argument("ids", nargs="+", help=L("session IDs or unique prefixes", "Session ID 或唯一前缀"))
-    un = sub.add_parser("untrack", help=L("stop watching sessions", "取消跟踪"))
+    un = command("untrack", help=L("stop watching sessions", "取消跟踪"))
     un.add_argument("ids", nargs="+")
-    tk = sub.add_parser("task", help=L("register a goal and checks for a session", "登记任务目标与验收条件"))
+    tk = command("task", help=L("register a goal and checks for a session", "登记任务目标与验收条件"))
     tk.add_argument("id")
     tk.add_argument("--name", help=L("short name shown in briefs", "简报里显示的短名"))
     tk.add_argument("--goal")
@@ -2582,9 +2663,9 @@ def argument_parser(parser_class=argparse.ArgumentParser):
                     help=L("path the agent must not change (such as tests); repeatable", "不允许改动的路径（如测试目录），可重复"))
     tk.add_argument("--rebase", action="store_true", help=L("reset the scope check's starting point to the current HEAD",
                                                             "把范围检查的起点重设为当前 HEAD"))
-    ck = sub.add_parser("check", help=L("run a task's checks now", "立即运行某个任务的检查"))
+    ck = command("check", help=L("run a task's checks now", "立即运行某个任务的检查"))
     ck.add_argument("id")
-    nw = sub.add_parser("new", help=L("create a task: contract, own worktree and session, and the kickoff prompt",
+    nw = command("new", help=L("create a task: contract, own worktree and session, and the kickoff prompt",
                                       "立项：新建任务合同、独立 worktree 和会话，并发出开场指令"))
     nw.add_argument("intent", nargs="?", help=L("one-sentence task intent; draft the contract from the repo", "一句话任务意图，自动起草合同"))
     nw.add_argument("--yes", action="store_true", help=L("accept the intent draft without prompting", "直接接受意图草稿，不询问"))
@@ -2615,14 +2696,14 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     nw.add_argument("--draft", action="store_true", help=L("save the contract only; do not start", "只保存合同，不启动"))
     nw.add_argument("--dry-run", action="store_true", help=L("only print the contract, the aoe command and the kickoff prompt",
                                                              "只打印合同、aoe 命令和开场指令"))
-    sub.add_parser("tasks", help=L("the task board", "任务看板"))
-    ko = sub.add_parser("kickoff", help=L("start a draft task, or resend the kickoff to a ready session",
+    command("tasks", help=L("the task board", "任务看板"))
+    ko = command("kickoff", help=L("start a draft task, or resend the kickoff to a ready session",
                                           "（重新）启动草稿任务，或给已就绪的会话补发开场指令"))
     ko.add_argument("id")
     ko.add_argument("--trust", action="store_true")
     close_help = L("finish a task and archive its AoE session, stopping its process; keep worktree, branch and progress",
                    "结束任务并归档 AoE 会话、停止进程；保留 worktree、分支和进度")
-    cl = sub.add_parser("close", help=close_help, description=close_help)
+    cl = command("close", help=close_help, description=close_help)
     cl.add_argument("id")
     cl.add_argument("--abandon", action="store_true", help=L("mark it abandoned instead of done", "标记为放弃而不是完成"))
     cl.add_argument("--remove-session", action="store_true", help=L("preserve progress, then trash the session/worktree immediately (keep branch)",
@@ -2631,18 +2712,18 @@ def argument_parser(parser_class=argparse.ArgumentParser):
                                                            "worktree 有未提交改动时仍然删除"))
     clean_help = L("trash done/abandoned tasks' sessions and clean worktrees after confirmation; keep branches by default",
                    "确认后将已完成或放弃任务的会话和干净 worktree 移入回收站；默认保留分支")
-    cn = sub.add_parser("clean", help=clean_help, description=clean_help)
+    cn = command("clean", help=clean_help, description=clean_help)
     cn.add_argument("--dry-run", action="store_true", help=L("list candidates, skips and branch actions without prompting or changing anything",
                                                              "列出候选任务、跳过原因和分支操作；不询问、不修改"))
     cn.add_argument("--branches", action="store_true", help=L("also delete verified merged branches after successful removal, using git branch -d",
                                                               "成功清理后用 git branch -d 删除已验证合并的分支"))
-    dl = sub.add_parser("decisions", help=L("the decision queue: workers' questions and chief's drafts",
+    dl = command("decisions", help=L("the decision queue: workers' questions and chief's drafts",
                                             "决策队列：Worker 提出的问题，以及 chief 起草的答复"))
     dl.add_argument("--all", action="store_true", help=L("also show resolved decisions", "也显示已处理的"))
     dl.add_argument("--stats", action="store_true", help=L("acceptance rate of chief's drafts (decides what may run automatically later)",
                                                            "chief 草稿的采纳率（决定以后哪些类别可以 auto）"))
     dl.add_argument("--no-refresh", action="store_true", help=L("read the queue without a pass first", "不先巡检，直接读队列"))
-    dc = sub.add_parser("decide", help=L("resolve a decision: approve tests, accept chief's draft, send feedback, or close it",
+    dc = command("decide", help=L("resolve a decision: approve tests, accept chief's draft, send feedback, or close it",
                                          "处理一条决策：批准测试、采纳 chief 的草稿、发送反馈，或不发送直接关闭"))
     dc.add_argument("id", help=L("decision ID such as calc-fix:1; a bare number works if it is unique among pending ones",
                                  "决策 ID，如 calc-fix:1；待决项里唯一时也可以只写序号"))
@@ -2659,22 +2740,22 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     dc.add_argument("--ai", action="store_true", help=L("after the rules, let AI judge and draft too (implies --redraft)",
                                                         "规则之后再让 AI 判断一次并起草（隐含 --redraft）"))
     dc.add_argument("--engine", choices=["codex", "claude"])
-    tc = sub.add_parser("tick", help=L("one pass plus automatic actions: continue, recover, review",
+    tc = command("tick", help=L("one pass plus automatic actions: continue, recover, review",
                                        "巡检一次并自动推进：检查没过就继续、中断就恢复、全过就交叉审查"))
     tc.add_argument("--dry-run", action="store_true", help=L("only say what would be done", "只说会做什么，不执行"))
-    wa = sub.add_parser("watch", help=L("tick every N seconds (Ctrl-C to stop)", "每隔一段时间 tick 一次（Ctrl-C 退出）"))
+    wa = command("watch", help=L("tick every N seconds (Ctrl-C to stop)", "每隔一段时间 tick 一次（Ctrl-C 退出）"))
     wa.add_argument("--every", type=int, default=300, help=L("interval in seconds (default 300)", "间隔秒数（默认 300）"))
-    ro = sub.add_parser("rotate", help=L("start a fresh session in the same worktree, continuing from progress.md",
+    ro = command("rotate", help=L("start a fresh session in the same worktree, continuing from progress.md",
                                          "在同一 worktree 换一个新会话，从 progress.md 接着做"))
     ro.add_argument("id")
-    nd = sub.add_parser("nudge", help=L("send the worker your guidance or the review issues, and resume automation",
+    nd = command("nudge", help=L("send the worker your guidance or the review issues, and resume automation",
                                         "给 Worker 发你的指示或退回审查意见，并恢复自动推进"))
     nd.add_argument("id")
     nd.add_argument("text", nargs="?")
     nd.add_argument("--review", action="store_true", help=L("include the review card's Issues", "附上审查卡的 Issues，退回修改"))
-    rv = sub.add_parser("review", help=L("run a cross review of a task now", "立即对任务做一次交叉审查"))
+    rv = command("review", help=L("run a cross review of a task now", "立即对任务做一次交叉审查"))
     rv.add_argument("id")
-    br = sub.add_parser("brief", help=L("one pass and a brief", "巡检并生成简报"))
+    br = command("brief", help=L("one pass and a brief", "巡检并生成简报"))
     br.add_argument("--ai", action="store_true", help=L("have a separate read-only AI write a decision-oriented brief",
                                                         "调用独立只读 AI 写决策导向简报"))
     br.add_argument("--engine", choices=["codex", "claude"], help=L("engine for this run (default: config engine, initially codex)",
@@ -2685,7 +2766,7 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     br.add_argument("--no-checks", action="store_true", help=L("do not run checks this time (reuse the last results)",
                                                                "本次不运行检查命令（沿用上次结果）"))
     br.add_argument("--prompt-only", action="store_true", help=L("only print what would be sent to the AI", "只打印将发给 AI 的内容"))
-    en = sub.add_parser("engine", help=L("show or set the default AI engine and list the models per level",
+    en = command("engine", help=L("show or set the default AI engine and list the models per level",
                                          "查看或设置默认 AI 引擎，并列出各档位模型"))
     en.add_argument("name", nargs="?", choices=["codex", "claude"])
     inbox_help = L("Interactive inbox. '?' opens a one-line AI question box; Enter submits a nonempty question. "
@@ -2716,14 +2797,14 @@ def argument_parser(parser_class=argparse.ArgumentParser):
                    "':' 打开受限命令栏（chief 前缀可省略；支持 aoe list 及指定 session 命令）。"
                    "Tab 补全命令和 ID，↑↓ 浏览历史，Enter 后台运行，Esc 终止命令进程（已完成操作不会撤销）。"
                    "关闭、清理、停止和归档需要 y/N 确认。输出保留在日志条目中；交互 shell 请用 chief console。")
-    ib = sub.add_parser("inbox", help=L("interactive inbox with ':' commands", "交互收件箱，支持 ':' 命令"),
+    ib = command("inbox", help=L("interactive inbox with ':' commands", "交互收件箱，支持 ':' 命令"),
                         description=inbox_help)
     ib.add_argument("--every", type=int, default=15, help=L("refresh interval in seconds (default 15; checks never run here)",
                                                             "刷新间隔秒数（默认 15；这里从不运行检查）"))
-    sh = sub.add_parser("show", help=L("drill into a session or task", "展开某个 Session 或任务"))
+    sh = command("show", help=L("drill into a session or task", "展开某个 Session 或任务"))
     sh.add_argument("id")
     sh.add_argument("--turns", type=int, default=3)
-    co = sub.add_parser("console", help=L("tmux inbox and interactive user shell", "tmux 收件箱与交互 shell"),
+    co = command("console", help=L("tmux inbox and interactive user shell", "tmux 收件箱与交互 shell"),
                         description=L("Split inbox left and interactive shell right by default. Inside tmux use the "
                                       "current window/pane; outside create and attach a session. Shell directory defaults "
                                       "to home (~). Optionally place inbox top and shell bottom.",
@@ -2734,12 +2815,23 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     co.add_argument("--shell-cwd", default="~", metavar="PATH",
                     help=L("shell working directory (default: home ~)", "shell 工作目录（默认家目录 ~）"))
     co.add_argument("--every", type=int, default=15, help=L("inbox refresh interval", "收件箱刷新间隔"))
+    if selected is not None and selected not in sub.choices:
+        # Unknown commands retain the complete list in argparse's error/help.
+        return argument_parser(parser_class)
     return ap
+
+
+@lru_cache(maxsize=64)
+def cli_parser(language, selected=None):
+    """CLI definitions are independent of config, cwd and parsed values."""
+    return argument_parser(selected=selected)
 
 
 def main(argv=None):
     global LANG
-    args = argument_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    selected = argv[0] if argv and not argv[0].startswith("-") else None
+    args = cli_parser(LANG, selected).parse_args(argv)
     try:
         cfg = load_json(CFG, {"profile": "main"}) if args.command == "clean" else config()
         if args.command == "init":
