@@ -875,7 +875,10 @@ def allowed_change_lines(task, scope=None, english=False):
 
 TASKS = ROOT / "tasks"
 ACTIVE = ("running", "needs-you", "review")
-TRUST_RE = re.compile(r"Trust this folder\?|Do you trust the files in this folder")
+# Match whole question lines, allowing terminal borders but not quoted questions in prose.
+TRUST_RE = re.compile(
+    r"^[ \t│┃]*(?:Trust this folder\?|Do you trust the files in this folder\??|"
+    r"(?P<claude>Is this a project you created or one you trust\?))[ \t│┃]*$", re.M)
 # The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
 # shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
 INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
@@ -913,7 +916,7 @@ def resolve_sid(cfg, ident):
     return hits[0]["session_id"] if hits else find_row(listings(cfg), ident)["id"]
 
 def new_task_id(name):
-    base = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:30] or now_utc().strftime("task-%m%d-%H%M")
+    base = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:30].rstrip("-") or now_utc().strftime("task-%m%d-%H%M")
     tid, n = base, 2
     while (TASKS/tid).exists():
         tid, n = "{}-{}".format(base, n), n+1
@@ -1209,7 +1212,7 @@ def at_prompt(status, sc):
     return status in ("idle", "waiting") and bool(INPUT_RE.search(tail)) and not ASK_PATTERNS.search(tail)
 
 def wait_ready(cfg, sid, trust, timeout=120):
-    """Wait until the agent can take input. A "trust this folder" prompt is answered only when trust is True.
+    """Wait until the agent can take input. Trust prompts are answered at most once and only when trust is True.
     AoE may report idle before the TUI is drawn, so also require the input box on screen and no trust prompt."""
     end = time.time() + timeout
     while time.time() < end:
@@ -1218,16 +1221,19 @@ def wait_ready(cfg, sid, trust, timeout=120):
         except (RuntimeError, ValueError):
             st = None
         sc = screen(cfg, sid) or ""
-        if at_prompt(st, sc) and not TRUST_RE.search(sc):
+        trust_prompt = TRUST_RE.search(sc)
+        if at_prompt(st, sc) and not trust_prompt:
             time.sleep(2)                       # a freshly drawn input box may not own the keyboard yet
             return "ready"
-        if TRUST_RE.search(sc):
+        if trust_prompt:
             if not trust:
                 return "trust"
             target = tmux_target(sid)
             if target:
-                call(["tmux", "send-keys", "-t", target, "Enter"], timeout=5)
-                trust = False                   # press it only once
+                # Claude's new prompt needs its affirmative option selected explicitly.
+                keys = ["1", "Enter"] if trust_prompt.group("claude") else ["Enter"]
+                call(["tmux", "send-keys", "-t", target] + keys, timeout=5)
+                trust = False                   # answer it only once
         time.sleep(3)
     return "timeout"
 
