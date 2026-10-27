@@ -139,9 +139,18 @@ def entry(ch, x):
     for l, m, _ in sigs:
         detail.append((l, MARK.get(l, "   ") + " " + m))
     dec = x.get("decision")
+    test_approval = bool(dec and dec.get("kind") == "test-approval" and dec.get("state", "pending") == "pending"
+                         and ch.is_test_approval(task, dec.get("question")))
     if dec:
         detail.append(("head", L("Decision {} ({}, by {})", "决策 {}（{}，{} 判断）").format(dec["id"], dec["size"], dec.get("by"))))
         detail.append(("text", L("Q: ", "问：") + (dec.get("question") or "")))
+        if test_approval:
+            detail.append(("text", L(
+                "a approves and locks the listed files plus discovered test support files and starts build.",
+                "a 批准并锁定列出的文件及发现的测试辅助文件，开始构建。")))
+            detail.append(("text", L(
+                "r sends feedback and keeps the test phase; consent-looking replies ask for confirmation.",
+                "r 发送反馈并保留测试阶段；看似同意的回复会要求确认。")))
         if dec.get("draft"):
             detail.append(("draft", L("Chief's draft: ", "chief 草稿：") + (dec.get("choice") or dec["draft"])))
         elif dec.get("why"):
@@ -174,7 +183,7 @@ def entry(ch, x):
             "tool": x.get("tool") or "", "status": x.get("status") or "", "ago": ch.ago(log.get("last_ts")),
             "level": lv, "headline": sigs[0][1] if sigs else (ft.get("conclusion") or ""),
             "decision": dec, "draft": bool(dec and dec.get("draft")),
-            "test_approval": bool(dec and dec.get("kind") == "test-approval"),
+            "test_approval": test_approval,
             "issues": bool(review and review.get("issues")), "detail": detail}
 
 def entries(ch, result):
@@ -186,7 +195,7 @@ def keys_for(ch, e):
     L = ch.L
     k = []
     if e and e["decision"] and (e["draft"] or e.get("test_approval")):
-        k.append(L("a accept", "a 采纳"))
+        k.append(L("a approve tests", "a 批准测试") if e.get("test_approval") else L("a accept", "a 采纳"))
     if e and e["status"] != "missing":
         k.append(L("r reply", "r 回复"))       # a pending decision, a board task or any tracked session
     if e and e["decision"]:
@@ -1072,6 +1081,29 @@ class Inbox:
             raise RuntimeError(self.ch.L("{} is already {}", "{} 已经是 {} 状态").format(d["id"], d["state"]))
         return d
 
+    def accept_entry(self, e):
+        ch, L = self.ch, self.ch.L
+        approval = e.get("test_approval")
+        self.job(L("approving the acceptance tests", "批准验收测试") if approval else L("sending the draft", "发送草稿"),
+                 lambda: self.sent(ch.accept_decision(self.cfg, self.decision(e)),
+                                   L("approved the acceptance tests", "已批准验收测试") if approval else
+                                   L("sent chief's draft", "已发送 chief 的草稿")))
+
+    def reply_entry(self, e, text):
+        ch, L = self.ch, self.ch.L
+
+        def feedback():
+            self.job(L("sending your reply", "发送回复"),
+                     lambda: self.sent(ch.reply_decision(self.cfg, self.decision(e), text),
+                                       L("sent your decision", "已发送你的决定")))
+
+        if e.get("test_approval") and ch.looks_like_test_consent(text):
+            self.confirm(L("Approve the tests? [y/N]", "批准测试？[y/N]"), lambda: self.accept_entry(e),
+                         declined=L("Keeping the test phase; reply is feedback", "保留测试阶段；回复作为反馈处理"))
+            self.st["confirm"]["declined_then"] = feedback
+        else:
+            feedback()
+
     def task(self, e):
         return self.ch.load_task(e["task"])
 
@@ -1333,16 +1365,10 @@ class Inbox:
         elif k == "t":
             self.job(L("ticking", "tick 中"), lambda: "tick: " + ("; ".join(ch.tick(self.cfg)) or L("nothing to do", "无需处理")))
         elif k == "a" and e and (e["draft"] or e.get("test_approval")):
-            approval = e.get("test_approval")
-            self.job(L("approving the acceptance tests", "批准验收测试") if approval else L("sending the draft", "发送草稿"),
-                     lambda: self.sent(ch.accept_decision(self.cfg, self.decision(e)),
-                                       L("approved the acceptance tests", "已批准验收测试") if approval else
-                                       L("sent chief's draft", "已发送 chief 的草稿")))
+            self.accept_entry(e)
         elif k == "r" and e and e["decision"]:      # answers the queued decision, and records how you answered
             self.ask(L("Reply to {}: ", "回复 {}：").format(e["decision"]["id"]),
-                     lambda text: self.job(L("sending your reply", "发送回复"),
-                                           lambda: self.sent(ch.reply_decision(self.cfg, self.decision(e), text),
-                                                             L("sent your decision", "已发送你的决定"))))
+                     lambda text: self.reply_entry(e, text))
         elif k == "r" and e and e["task"]:          # no queued decision: your words go to the worker as guidance
             self.ask(L("Reply to {}: ", "回复 {}：").format(e["task"]),
                      lambda text: self.job(L("sending your reply", "发送回复"),
@@ -1448,9 +1474,9 @@ class Inbox:
         if k in ("y", "Y"):
             c["then"]()
         else:
+            self.st["msg"] = c.get("declined") or self.ch.L("cancelled", "已取消")
             if c.get("declined_then"):
                 c["declined_then"]()
-            self.st["msg"] = c.get("declined") or self.ch.L("cancelled", "已取消")
 
     def open_session(self, scr, e):
         """Inside tmux: switch to the agent's tmux session. Otherwise: attach with AoE, and come back on detach."""

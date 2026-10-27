@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 
 ROOT = Path(os.environ.get("AOE_CHIEF_HOME", str(Path.home()/".local/state/aoe-chief"))).expanduser()
 CFG = ROOT / "config.json"
@@ -552,10 +553,27 @@ def is_test_file(path):
     return bool(re.match(r"(?:test.*\.py|.*_test\.py|test_.*\.rb|.*_(?:test\.go|spec\.rb)|"
                          r".*\.(?:test|spec)\.[cm]?[jt]sx?|(?:Test.*|.*Tests?)\.(?:java|kt))$", name))
 
+def scope_changes(diff):
+    """Parse a NUL-delimited Git diff, retaining both sides of renames."""
+    changes, renamed = {}, set()
+    fields = iter(diff.rstrip("\0").split("\0") if diff else [])
+    for status in fields:
+        source = next(fields)
+        if status.startswith(("R", "C")):
+            destination = next(fields)
+            if status.startswith("R"):
+                changes[source] = "D"  # protection follows the source as well as the destination
+                renamed.add(destination)
+            changes[destination] = "A" if status.startswith("C") else "R"
+        else:
+            changes[source] = status[0]
+    return changes, renamed
+
 def scope_info(path, task, extra_ignore=()):
     """Scope/protection since base; acceptance tests may change during the test phase."""
     scope, protected = task.get("scope"), task.get("protected") or []
-    if not (scope or protected) or not path:
+    testing = in_test_phase(task)
+    if not path or not (scope or protected or testing):
         return None
     try:
         top = call(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=8).strip()
@@ -565,21 +583,25 @@ def scope_info(path, task, extra_ignore=()):
         # on disk; those staged contents can still be committed by the worker.
         diff += call(["git", "-C", top, "diff", "--cached", "--name-status", "-z", "--find-renames",
                       task.get("base") or "HEAD", "--"], timeout=15)
-        changes = {}
-        fields = iter(diff.rstrip("\0").split("\0") if diff else [])
-        for status in fields:
-            source = next(fields)
-            if status.startswith(("R", "C")):
-                destination = next(fields)
-                if status.startswith("R"):
-                    changes[source] = "D"  # protection follows the old path as well as the new one
-                changes[destination] = "A" if status.startswith("C") else "R"
-            else:
-                changes[source] = status[0]
+        changes, renamed = scope_changes(diff)
         untracked = call(["git", "-C", top, "ls-files", "-z", "--others", "--exclude-standard"], timeout=15)
         for name in untracked.split("\0"):
             if name:
                 changes.setdefault(name, "A")
+        baseline, committed_support = {}, set()
+        if testing:
+            tree = call(["git", "-C", top, "ls-tree", "-r", "-z", task.get("base") or "HEAD", "--"], timeout=15)
+            for entry in tree.split("\0"):
+                if entry:
+                    metadata, name = entry.split("\t", 1)
+                    baseline[name] = metadata.split()[2]
+            # A newly committed helper may have been removed from both the
+            # working tree and index. It must still be validated against HEAD.
+            committed, moved = scope_changes(call(
+                ["git", "-C", top, "diff", "--name-status", "-z", "--find-renames",
+                 task.get("base") or "HEAD", "HEAD", "--"], timeout=15))
+            renamed.update(moved)
+            committed_support = {n for n, status in committed.items() if status == "A" and not is_test_file(n)}
     except (RuntimeError, ValueError, StopIteration):
         return None
     pats = SCOPE_IGNORE + list(extra_ignore)
@@ -589,23 +611,68 @@ def scope_info(path, task, extra_ignore=()):
         d = os.path.normpath(os.path.join(path, d))
         return f == d or f.startswith(d.rstrip("/") + "/")
     rel = lambda f: os.path.relpath(f, path)
-    test_dirs = infer_protected(path) if in_test_phase(task) else []
+    test_dirs = infer_protected(path) if testing else []
+    # Support discovery also covers committed files whose whole directory was
+    # removed since HEAD. The conventional-test exemption still uses test_dirs.
+    support_dirs = ["tests", "test"] if testing else []
+
+    def in_support_dir(f):
+        return any(f.startswith(os.path.normpath(os.path.join(path, d)).rstrip("/") + "/") for d in support_dirs)
+
+    if testing:
+        # A protected custom suite can be named tests/specs/acceptance, or contain
+        # conventional tests. Configuration-only protected directories stay red.
+        known_paths = [os.path.join(top, n) for n in set(baseline) | committed_support]
+        known_tests = [f for f in known_paths if is_test_file(f)]
+        for directory in protected:
+            absolute = os.path.normpath(os.path.join(path, directory))
+            if absolute == os.path.normpath(path):
+                continue  # Protecting the whole repository does not make it a test directory.
+            is_directory = (Path(absolute).is_dir() or
+                            any(f != absolute and under(f, directory) for f in known_paths))
+            if is_directory and (
+                    any(part.lower() in ("test", "tests", "spec", "specs", "acceptance")
+                        for part in Path(directory).parts) or any(os.path.dirname(f) == absolute for f in known_tests)):
+                support_dirs.append(directory)
+        for name in committed_support:
+            if not ignored(name, pats) and in_support_dir(os.path.join(top, name)):
+                files.setdefault(os.path.join(top, name), "A")
+        # Git cannot pair an untracked destination with its deleted source.
+        # Recognize exact-content moves without touching the index or object store.
+        deleted_blobs = {baseline[n] for n, status in changes.items()
+                         if status == "D" and n in baseline and not ignored(n, pats)}
+        candidates = [n for n in untracked.split("\0") if n and n not in baseline and not is_test_file(n)
+                      and not ignored(n, pats) and in_support_dir(os.path.join(top, n))]
+        if deleted_blobs and candidates:
+            try:
+                hashes = call(["git", "-C", top, "hash-object", "--"] +
+                              [os.path.join(top, n) for n in candidates], timeout=15).splitlines()
+            except RuntimeError:
+                return None
+            renamed.update(n for n, blob in zip(candidates, hashes) if blob in deleted_blobs)
     explicit = {os.path.normpath(os.path.join(path, d)) for d in protected}
-    touched, additions, violations = [], [], []
+    touched, additions, support, violations = [], [], [], []
     for f in sorted(files):
-        if not any(under(f, d) for d in protected):
-            continue
         test = is_test_file(f)
         if test and f not in explicit and any(under(f, d) for d in test_dirs):
             continue
+        new_support = (testing and not test and f not in explicit
+                       and (files[f] == "A" or os.path.relpath(f, top) in committed_support)
+                       and os.path.relpath(f, top) not in baseline and os.path.relpath(f, top) not in renamed
+                       and in_support_dir(f))
+        if not new_support and not any(under(f, d) for d in protected):
+            continue
         touched.append(rel(f))
-        if files[f] == "A" and test and f not in explicit:
+        if new_support:
+            support.append(rel(f))
+        elif files[f] == "A" and test and f not in explicit:
             additions.append(rel(f))
         else:
             violations.append(rel(f))
     return {"base": (task.get("base") or "")[:10], "changed": len(files),
             "out_of_scope": [rel(f) for f in sorted(files) if scope and not under(f, scope)][:20],
-            "protected_touched": touched, "protected_violations": violations, "protected_added_tests": additions}
+            "protected_touched": touched, "protected_violations": violations, "protected_added_tests": additions,
+            "protected_added_support": support}
 
 # ---------- Task board ----------
 # One directory per task: tasks/<id>/task.json. The task is the source of truth; sessions only execute it.
@@ -794,6 +861,33 @@ TEST_APPROVAL_RE = re.compile(r"^\s*approve the acceptance tests\b(.*)", re.I | 
 def is_test_approval(t, question):
     return in_test_phase(t) and bool(TEST_APPROVAL_RE.match(question or ""))
 
+TEST_CONSENT_RE = re.compile(
+    r"looks\s+good|go\s+ahead|approved|approve|okay|ok|yes|y|lgtm|可以|好的|好|行|同意|批准|没问题")
+
+def looks_like_test_consent(text):
+    """Recognize complete consent phrases; this never grants approval."""
+    text = text.casefold()
+    separator = lambda c: c.isspace() or unicodedata.category(c).startswith("P")
+    start, end = 0, len(text)
+    while start < end and separator(text[start]):
+        start += 1
+    while end > start and separator(text[end - 1]):
+        end -= 1
+    if start == end:
+        return False
+    while start < end:
+        match = TEST_CONSENT_RE.match(text, start, end)
+        if not match:
+            return False
+        start = match.end()
+        if start == end:
+            return True
+        if not separator(text[start]):
+            return False
+        while start < end and separator(text[start]):
+            start += 1
+    return False
+
 def approval_files(question):
     match = TEST_APPROVAL_RE.match(question or "")
     if not match:
@@ -854,7 +948,8 @@ def kickoff_prompt(t, resume=False):
         lines.append(("- Protected paths (acceptance tests may change during the test phase): " if testing else
                       "- Never modify: ") + ", ".join(t["protected"]))
     if testing:
-        lines.append("- During this phase you may add or revise acceptance tests in test directories, including protected ones.")
+        lines.append("- During this phase you may edit, add, delete or rename conventional acceptance test files under inferred test directories, unless explicitly protected as files.")
+        lines.append("- You may add new test support files (helpers, conftest.py, fixtures) in test directories; commit them for review and approval too.")
         lines.append("- All other protected files must remain unchanged.")
     lines.append("- Never push, merge, deploy, or delete branches. Work only on the current branch.")
     b = t.get("budget") or {}
@@ -1199,15 +1294,23 @@ def send_decision(cfg, d, text, resolution):
     if in_test_phase(t):
         if resolution == "accepted" and is_test_approval(t, d.get("question")):
             files = approval_files(d["question"])
-            updated = approve_tests(t, files)
+            if not files:
+                raise ValueError("approval needs acceptance test files")
             wt = t.get("worktree") or t["repo"]
+            scope = scope_info(wt, t, cfg.get("scope_ignore", []))
+            if scope is None:
+                raise RuntimeError(L("cannot inspect test support files for approval", "无法检查待批准的测试辅助文件"))
+            files = list(dict.fromkeys(files + scope["protected_added_support"]))
+            updated = approve_tests(t, files)
             if any(not (Path(wt)/p).is_file() for p in files):
-                raise RuntimeError("acceptance test files must exist in the worker repository")
+                raise RuntimeError(L("acceptance tests and support files must exist in the worker repository",
+                                     "验收测试及辅助文件必须存在于 Worker 仓库中"))
             call(["git", "-C", wt, "ls-files", "--error-unmatch", "--"] + files, timeout=8)
             call(["git", "-C", wt, "diff", "--exit-code", "HEAD", "--"] + files, timeout=8)
+            call(["git", "-C", wt, "diff", "--cached", "--exit-code", "HEAD", "--"] + files, timeout=8)
             save_task(updated)           # protect tests before the worker receives permission to implement
             text = user_reply("The acceptance tests {} are approved. Phase: build. Implement the goal now: {}\n"
-                              "The approved test files are protected; do not modify them. Run the contract's checks."
+                              "The approved test files and test support files are protected; do not modify them. Run the contract's checks."
                               .format(", ".join(files), t["goal"]))
         else:
             text += ("\nRemain in the test phase: revise the acceptance tests, commit them, and stop with "
@@ -1897,6 +2000,9 @@ def judge(it):
     if sc and sc.get("protected_added_tests"):
         s.append(("yellow", L("new tests in protected directories; review: ", "受保护目录中新增测试；请审查：") +
                   sep().join(sc["protected_added_tests"]), "new-tests"))
+    if sc and sc.get("protected_added_support"):
+        s.append(("yellow", L("new test support files; review: ", "新增测试辅助文件；请审查：") +
+                  sep().join(sc["protected_added_support"]), "new-test-support"))
     if sc and sc["out_of_scope"]:
         s.append(("yellow", L("{} changes out of scope: {}", "{} 个改动超出范围：{}").format(
             len(sc["out_of_scope"]), sep().join(sc["out_of_scope"][:3])), "scope"))
@@ -1993,8 +2099,12 @@ def basic(result):
             dec = x.get("decision")
             if dec:
                 out.append(L("  - Handle: ", "  - 处理：") + (
+                    L("`chief.py decide {0} --accept` approves and locks tests/support files and starts build; "
+                      "`--reply \"...\"` sends feedback and keeps the test phase",
+                      "`chief.py decide {0} --accept` 批准并锁定测试及辅助文件，开始构建；"
+                      "`--reply \"...\"` 发送反馈并保留测试阶段") if dec.get("kind") == "test-approval" else
                     L("`chief.py decide {0} --accept` (or `--reply \"...\"`)", "`chief.py decide {0} --accept`（或 `--reply \"...\"`）")
-                    if dec.get("draft") or dec.get("kind") == "test-approval" else
+                    if dec.get("draft") else
                     L("`chief.py decide {0} --reply \"your decision\"`", "`chief.py decide {0} --reply \"你的决定\"`")).format(dec["id"]))
             ft = log.get("footer") or {}
             if ft.get("conclusion"):
@@ -2062,12 +2172,15 @@ Rules:
   files, tests). Do not call anything done without evidence.
 - checks are the results of check commands chief just ran: verified evidence that outranks the agent's claims. When
   they fail, use output_tail to say where it is stuck. scope.protected_violations lists forbidden changes: always warn
-  the user. scope.protected_added_tests lists new tests requiring yellow review, not a protection violation; include
+  the user. scope.protected_added_tests and scope.protected_added_support list new tests and test support files
+  requiring yellow review, not a protection violation; include
   their paths. For older scope data without these fields, treat scope.protected_touched as forbidden changes.
 - When there is a goal / done_when, judge how far the item is from it.
 - agent_footer is the agent's closing block (Conclusion / Evidence / Blockers / Next step / Decision needed). Prefer it,
   but it is still the agent's claim: weigh it against the evidence. When relaying a decision, keep the agent's options
   and recommendation so the user can decide at once, and give the decide command for pending_decision.id.
+- A pending test approval always requires the user's explicit --accept to lock tests and discovered support files
+  and start build. --reply is feedback that keeps the test phase, even if its text sounds like consent.
 - Do not replay logs and do not invent facts that are not in the data; if information is missing, say so.
 
 Previous brief (to tell what is new; may be empty):
@@ -2141,6 +2254,9 @@ def show(cfg, sid, n):
             sc["changed"], sc["base"] or "HEAD", len(sc["out_of_scope"]), protected_count))
         if sc.get("protected_added_tests"):
             out.append(L("New tests to review: ", "待审查的新增测试：") + sep().join(sc["protected_added_tests"]))
+        if sc.get("protected_added_support"):
+            out.append(L("New test support files to review: ", "待审查的新增测试辅助文件：") +
+                       sep().join(sc["protected_added_support"]))
     g = git_info(rec.get("project_path"))
     if g:
         out.append(L("Git: {} · uncommitted {} · last commit {} ({})", "Git：{} · 未提交 {} · 最近提交 {}（{}）").format(
@@ -2526,13 +2642,17 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     dl.add_argument("--stats", action="store_true", help=L("acceptance rate of chief's drafts (decides what may run automatically later)",
                                                            "chief 草稿的采纳率（决定以后哪些类别可以 auto）"))
     dl.add_argument("--no-refresh", action="store_true", help=L("read the queue without a pass first", "不先巡检，直接读队列"))
-    dc = sub.add_parser("decide", help=L("resolve a decision: accept chief's draft, send your own answer, or close it",
-                                         "处理一条决策：采纳 chief 的草稿、用你的答复，或不发送直接关闭"))
+    dc = sub.add_parser("decide", help=L("resolve a decision: approve tests, accept chief's draft, send feedback, or close it",
+                                         "处理一条决策：批准测试、采纳 chief 的草稿、发送反馈，或不发送直接关闭"))
     dc.add_argument("id", help=L("decision ID such as calc-fix:1; a bare number works if it is unique among pending ones",
                                  "决策 ID，如 calc-fix:1；待决项里唯一时也可以只写序号"))
     choice = dc.add_mutually_exclusive_group()
-    choice.add_argument("--accept", action="store_true", help=L("send chief's draft to the worker", "把 chief 的草稿发给 Worker"))
-    choice.add_argument("--reply", metavar="TEXT", help=L("send your own decision", "发送你自己的决定"))
+    choice.add_argument("--accept", action="store_true", help=L(
+        "approve tests and lock the listed tests and discovered support files before build, or send chief's draft",
+        "批准测试，在构建前锁定列出的测试及发现的辅助文件，或发送 chief 的草稿"))
+    choice.add_argument("--reply", metavar="TEXT", help=L(
+        "send your own decision; test-approval replies are feedback and keep the test phase, even consent text",
+        "发送你自己的决定；测试审批的回复均为反馈，保留测试阶段，包括同意用语"))
     choice.add_argument("--dismiss", metavar="REASON", nargs="?", const="",
                         help=L("close without sending (for example, you answered in the session)", "不发送，直接关闭（例如你已在会话里回答）"))
     dc.add_argument("--redraft", action="store_true", help=L("re-judge the size and redraft with the current rules", "按当前规则重新判断大小并起草"))
@@ -2830,9 +2950,14 @@ def main(argv=None):
                        L("Sent chief's draft", "已发送 chief 的草稿")) + ("" if ok else L(", but delivery was not confirmed; check the session",
                                                                                      "，但没确认送达，进入会话看看")))
             elif args.reply:
+                consent_feedback = (is_test_approval(load_task(d["task"]), d.get("question")) and
+                                    looks_like_test_consent(args.reply))
                 ok = reply_decision(cfg, d, args.reply)
                 print(L("Sent your decision", "已发送你的决定") + ("" if ok else L(", but delivery was not confirmed; check the session",
                                                                                "，但没确认送达，进入会话看看")))
+                if consent_feedback:
+                    print(L("This reply keeps the test phase; --accept approves the tests and starts build.",
+                            "此回复保留测试阶段；使用 --accept 批准测试并开始构建。"))
             elif args.dismiss is not None:
                 dismiss_decision(d, args.dismiss)
                 print(L("Closed {} (nothing was sent)", "已关闭 {}（未发送任何消息）").format(d["id"]))

@@ -73,8 +73,8 @@ $ chief brief
 
 - **🗂️ Task contracts:** `chief new` creates a goal, checks, scope, protected paths and a budget, plus a git
   worktree and a fresh agent session.
-- **✅ Objective done:** check commands decide when a task is done. Changes to protected paths, such as tests, are
-  flagged, so an agent cannot pass by editing the tests.
+- **✅ Objective done:** check commands decide when a task is done. During build, changes to protected paths,
+  such as tests, are flagged, so an agent cannot pass by editing the tests.
 - **📝 Decision queue:** small questions are drafted by Chief and approved with `--accept`. Big ones (push, delete,
   goal changes and the like) are always yours.
 - **🔁 Auto-continue:** when checks fail, Chief sends the failing output back to the agent. It recovers
@@ -140,7 +140,7 @@ and a cross review. The demo state lives in its own directory, so your real boar
 ~/aoe-chief/demo.sh
 export AOE_CHIEF_HOME=~/.local/state/aoe-chief-demo
 chief watch --every 30          # terminal 2: let Chief drive
-chief inbox                     # what needs you? press a to accept the drafted decision
+chief inbox                     # press a to accept a draft or explicitly approve pending tests
 chief decide shop-demo:1 --accept   # the same from the command line
 cat $AOE_CHIEF_HOME/tasks/shop-demo/review.md
 chief close shop-demo           # or: chief nudge shop-demo "also format prices with 2 decimals"
@@ -164,15 +164,38 @@ AI generation falls back to the inferred defaults. `--repo` selects another repo
 
 New tasks begin with a test phase: the worker writes failing acceptance tests, commits them, and asks you to
 approve the files. This is always a big decision with no Chief draft, including in auto mode. Accept it with
-`chief decide <decision-id> --accept` or `a` in the inbox to protect those tests and begin implementation.
-Reply with feedback to keep revising the tests. Chief does not automatically continue or review work before
-this approval. Add `--no-test-first` to begin implementation immediately.
+`chief decide <decision-id> --accept` or the Inbox action **`a approve tests`** (**`a 批准测试`** in Chinese).
+This locks the listed files and discovered new test support files, then starts build. Chief finds new helpers,
+`conftest.py` and fixtures inside inferred `tests/` and `test/` directories or protected test directories,
+even when the worker omitted them from the approval request. Every file in the complete approval set must
+exist in the worker's repository, be tracked, and match `HEAD` in both the working tree and index. Approval
+preserves existing protections and uses the worker's current `HEAD` as the build scope base. Generated files
+and configured `scope_ignore` exclusions remain ignored during discovery.
+
+Use `r` to send feedback and keep the test phase. Only for a pending test approval, a reply made entirely of
+consent phrases asks **`Approve the tests? [y/N]`** (**`批准测试？[y/N]`** in Chinese). Explicit `y`/`Y` uses the same
+approval path as `a`; every other answer, including Enter or Escape, sends the original reply as feedback.
+Recognition is case-insensitive and allows surrounding whitespace/punctuation and short combinations of:
+`ok`, `okay`, `yes`, `y`, `lgtm`, `approve`, `approved`, `looks good`, `go ahead`, `可以`, `好`, `好的`, `行`, `同意`,
+`批准`, `没问题`, separated by whitespace or punctuation. `okay 可以` qualifies; `ok but rename the test` sends
+feedback directly without a confirmation. Other Inbox reply contexts keep their usual behavior.
+
+`chief decide <decision-id> --reply "okay 可以"` still sends feedback, keeps the test phase, and never prompts
+or approves. A localized hint explains that `--accept` approves the tests. Chief never approves tests
+automatically, and does not automatically continue or review work before approval. Add `--no-test-first`
+to begin implementation immediately.
+
+During the test phase, genuinely new non-test support files appear as **yellow** review items with all their
+paths listed. Existing non-test protected files, explicitly protected/approved files, and their rename sources
+stay **red** when edited, deleted or renamed. A rename is not a new support-file addition; copying an unchanged
+source can be. Conventional test files under inferred test directories keep their existing exemption: the
+worker may edit, add, delete or rename them during the test phase unless explicitly protected as files.
 
 During implementation, new test files under protected directories appear as **yellow** review items, with
 their paths listed. Chief compares against the task's scope base, including committed, staged and untracked
 additions. Existing protected files changed or deleted remain **red**, including the source of a rename.
-Explicitly approved test files and non-test protected files remain protected. The test phase still permits
-acceptance-test edits and additions under test directories.
+Non-test additions under protected directories remain **red** during build. Explicitly approved test and
+support files remain protected.
 
 The existing flag-based form also works, without AI drafting or a contract confirmation prompt:
 
@@ -272,10 +295,14 @@ After confirming startup, let it finish; if startup fails, use the reported task
 The list separates **Delegated tasks** from tracked **Thinking sessions**, with urgent items first within each
 group. Arrow keys or j/k move between items and skip headings; refreshes retain the selected session.
 
-The footer shows only the keys that apply to the selected item: `a` accept Chief's draft, `r` reply (to the pending
+The footer shows only the keys that apply to the selected item: `a approve tests` / `a 批准测试` approves pending
+tests, locks the listed files plus discovered support files, and starts build; otherwise `a accept` / `a 采纳`
+accepts Chief's draft. The detail pane explains this approval action and that `r` sends feedback and keeps the
+test phase, with a confirmation for consent-only replies as described above. `r` replies to the pending
 decision if there is one, otherwise straight to the session: guidance for a board task, your words unchanged for a
-tracked session), `d` dismiss the decision, `n` send the worker guidance, `b` send the review issues back, `c` close the task as done,
-`o` open the session (inside tmux it switches to the agent's tmux session; `prefix L` comes back). Sends run in the
+tracked session. `d` dismisses the decision, `n` sends the worker guidance, `b` sends the review issues back,
+`c` closes the task as done, and `o` opens the session (inside tmux it switches to the agent's tmux session;
+`prefix L` comes back). Sends run in the
 background, so the inbox stays responsive. It refreshes every 15 seconds and never runs checks; `watch` does the
 driving.
 
@@ -418,7 +445,7 @@ sessions and summarize them (`chief track <session>`), but it does not drive the
 | | `nudge <id> [TEXT] [--review]` | Send guidance or review issues back, and resume automation |
 | | `rotate <id>`, `review <id>` | Start a fresh session now; run a cross review now |
 | 📝 Decide | `decisions [--all] [--stats]` | The decision queue and acceptance stats |
-| | `decide <id> --accept \| --reply TEXT \| --dismiss [REASON]` | Resolve a decision (`--redraft` / `--ai` re-judge it) |
+| | `decide <id> --accept \| --reply TEXT \| --dismiss [REASON]` | Approve tests and lock their support files, accept a draft, or send feedback; test-approval replies keep the test phase (`--redraft` / `--ai` re-judge it) |
 | ⚙️ Settings | `engine [codex\|claude]`, `lang [en\|zh]` | AI engine and models per level; output language |
 
 For `task <id>`, `--parked` suppresses inactivity reports and `--unpark` enables them again.
