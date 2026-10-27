@@ -177,7 +177,7 @@ class ApprovalInteractionTests(flow.ChiefFixture):
         entry = tui.entry(chief, self.item)
         self.assertEqual(entry["level"], "red")
         self.assertFalse(entry["draft"])
-        self.assertIn("a accept", tui.keys_for(chief, entry))
+        self.assertIn("a approve tests", tui.keys_for(chief, entry))
         app = tui.Inbox(self.cfg, chief, 15)
         app.st["entries"] = [entry]
         with mock.patch.object(app, "job", side_effect=lambda label, fn: fn()), \
