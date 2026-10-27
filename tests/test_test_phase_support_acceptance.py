@@ -31,6 +31,18 @@ class SupportReviewTests(ApprovalFixture):
                 self.assertIn(path, self.messages(signals, "yellow"), "every proposed support file needs visible review")
                 self.assertNotIn(path, self.messages(signals, "red"))
 
+    def assert_conventional_exemption(self, path, task=None):
+        self.assertTrue(chief.is_test_file(path), "the fixture must use a conventional test filename")
+        for lang in ("en", "zh"):
+            with self.subTest(language=lang, path=path), mock.patch.object(chief, "LANG", lang):
+                scope, signals = self.signals(task)
+                self.assertNotIn(path, scope["protected_touched"])
+                self.assertNotIn(path, scope["protected_violations"])
+                self.assertNotIn(path, scope["protected_added_tests"])
+                self.assertNotIn(path, self.messages(signals, "red"))
+                self.assertNotIn(path, self.messages(signals, "yellow"),
+                                 "conventional tests retain their existing test-phase exemption")
+
     def assert_red_in_every_phase(self, source, destination=None):
         for phase in ("test", "build", "legacy"):
             task = dict(self.task, phase=phase)
@@ -60,7 +72,53 @@ class SupportReviewTests(ApprovalFixture):
                     self.git("commit", "-q", "-m", "add acceptance test support")
                 for path in paths:
                     self.assert_review(path)
-                self.assert_review(self.listed)
+                self.assert_conventional_exemption(self.listed)
+
+    def test_conventional_test_edits_additions_deletions_and_renames_keep_the_existing_exemption(self):
+        edited = ("tests/test_existing.py", "test/feature.spec.ts")
+        added = ("tests/test_new.py", "test/new_feature_test.go")
+        deleted = ("tests/test_deleted.py", "test/LegacyTest.java")
+        renamed = (("tests/test_old_name.py", "tests/test_new_name.py"),
+                   ("test/feature.test.js", "test/renamed.test.js"),
+                   ("tests/test_moved.py", "src/moved_test.py"))
+        for path in edited + deleted + tuple(source for source, _ in renamed):
+            self.write(path, "original conventional test " + path + "\n")
+        self.git("add", "tests", "test")
+        self.git("commit", "-q", "-m", "baseline conventional test lifecycle fixtures")
+        task = dict(self.task, base=self.git("rev-parse", "HEAD"),
+                    protected=self.task["protected"] + ["test"])
+        for path in edited + added:
+            self.write(path, "revised conventional test " + path + "\n")
+        for path in deleted:
+            (self.repo / path).unlink()
+        for source, destination in renamed:
+            (self.repo / source).rename(self.repo / destination)
+        affected = edited + added + deleted + tuple(path for pair in renamed for path in pair)
+        for state in ("unstaged", "staged", "committed"):
+            if state == "staged":
+                self.git("add", "tests", "test", "src")
+            elif state == "committed":
+                self.git("commit", "-q", "-m", "revise add delete and rename conventional tests")
+            for implicit_phase in (False, True):
+                contract = dict(task)
+                if implicit_phase:
+                    contract.pop("phase")
+                with self.subTest(state=state, implicit_phase=implicit_phase):
+                    for path in affected:
+                        self.assert_conventional_exemption(path, contract)
+                    scope, _ = self.signals(contract)
+                    self.assertEqual(scope["protected_touched"], [])
+                    self.assertEqual(scope["protected_violations"], [])
+                    self.assertEqual(scope["protected_added_tests"], [])
+
+    def test_conventional_test_edit_outside_inferred_directories_keeps_its_existing_protection(self):
+        path = "qa/tests/test_existing.py"
+        self.write(path, "# conventional test outside inferred directories\n")
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "baseline protected custom test")
+        self.task["base"] = self.git("rev-parse", "HEAD")
+        self.write(path, "# unapproved change outside the established exemption\n")
+        self.assert_red_in_every_phase(path)
 
     def test_inferred_test_directories_are_reviewed_even_without_explicit_directory_protection(self):
         task = dict(self.task, protected=["config/production.json"])
@@ -152,14 +210,42 @@ class SupportReviewTests(ApprovalFixture):
         (self.repo / source).rename(self.repo / destination)
         self.assert_red_in_every_phase(source, destination)
 
-    def test_renamed_test_cannot_masquerade_as_a_new_support_file(self):
-        source, destination = "tests/test_existing.py", "tests/helpers/renamed_test.py"
+    def test_explicitly_protected_test_rename_cannot_masquerade_as_a_new_support_file(self):
+        source, destination = "tests/test_existing.py", "tests/helpers/renamed_acceptance.py"
+        self.assertFalse(chief.is_test_file(destination))
+        self.task["protected"].append(source)
         self.git("mv", source, destination)
         for state in ("staged", "committed"):
             with self.subTest(state=state):
                 if state == "committed":
                     self.git("commit", "-q", "-m", "rename an existing test to a helper")
                 self.assert_red_in_every_phase(source, destination)
+
+    def test_conventional_test_rename_to_support_keeps_source_exempt_and_destination_red(self):
+        source, destination = "tests/test_existing.py", "tests/helpers/renamed_acceptance.py"
+        self.assertFalse(chief.is_test_file(destination))
+        self.git("mv", source, destination)
+        for state in ("staged", "committed"):
+            with self.subTest(state=state):
+                if state == "committed":
+                    self.git("commit", "-q", "-m", "rename conventional test to non-test support")
+                self.assert_conventional_exemption(source)
+                for lang in ("en", "zh"):
+                    with self.subTest(language=lang), mock.patch.object(chief, "LANG", lang):
+                        scope, signals = self.signals()
+                        self.assertIn(destination, scope["protected_violations"])
+                        self.assertIn(destination, self.messages(signals, "red"))
+                        self.assertNotIn(destination, self.messages(signals, "yellow"))
+
+    def test_non_test_protected_rename_source_stays_red_even_when_destination_is_a_test(self):
+        source, destination = "tests/helpers/existing.py", "tests/test_renamed_helper.py"
+        self.git("mv", source, destination)
+        for state in ("staged", "committed"):
+            with self.subTest(state=state):
+                if state == "committed":
+                    self.git("commit", "-q", "-m", "rename protected support to a conventional test")
+                self.assert_red_in_every_phase(source, destination)
+                self.assert_conventional_exemption(destination)
 
     def test_rename_outside_test_directory_keeps_the_protected_source_visible(self):
         source, destination = "tests/helpers/existing.py", "src/moved_helper.py"
