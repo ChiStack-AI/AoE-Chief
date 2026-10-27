@@ -466,20 +466,35 @@ class BackgroundAndCancellationTests(support.CommandFixture):
 
     def test_output_is_scrollable_and_survives_refresh_and_selection_changes(self):
         self.selected_items()
+        self.items[0]["log"]["last_reply"] = "SELECTED_COMMAND_TASK_DETAILS"
+        self.items[1]["log"]["last_reply"] = "SELECTED_COMMAND_SESSION_DETAILS"
         self.control["rules"].append(dict(argv=["session", "show", "long"],
             stdout="\n".join("output-line-{:03d}".format(n) for n in range(90)) + "\n"))
         self.write_control()
         seen = set()
+        expected = {"output-line-{:03d}".format(n) for n in range(90)}
 
         def capture():
             seen.update(re.findall(r"output-line-\d{3}", self.detail()))
+
+        def selected_details(sid, marker):
+            self.assertEqual(self.app.selected()["sid"], sid)
+            self.assertIn(marker, self.detail(), "selection restores the item's details")
+            self.assertNotRegex(self.detail(), r"output-line-\d{3}", "old output is reachable through L")
 
         scroll = []
         for key in (tui.curses.KEY_PPAGE,) * 20 + (tui.curses.KEY_NPAGE,) * 20:
             scroll.extend([(key,), composer.Action(capture)])
         self.scenario(*self.command("aoe session show long"), composer.Check(self.assert_idle),
-                      *scroll, composer.Action(seen.clear), "g", composer.Check(self.assert_idle), "jk", *scroll)
-        self.assertEqual(seen, {"output-line-{:03d}".format(n) for n in range(90)})
+                      *scroll, composer.Action(lambda: self.assertEqual(seen, expected)),
+                      composer.Action(seen.clear), "g", composer.Check(self.assert_idle),
+                      "j", composer.Action(lambda: selected_details("live-2222", "SELECTED_COMMAND_SESSION_DETAILS")),
+                      "k", composer.Action(lambda: selected_details("live-1111", "SELECTED_COMMAND_TASK_DETAILS")),
+                      "g", composer.Check(self.assert_idle),
+                      composer.Action(lambda: selected_details("live-1111", "SELECTED_COMMAND_TASK_DETAILS")),
+                      "L", *scroll, "\x1b",
+                      composer.Action(lambda: selected_details("live-1111", "SELECTED_COMMAND_TASK_DETAILS")))
+        self.assertEqual(seen, expected)
 
     def test_escape_cancels_owned_process_discards_late_results_and_allows_a_new_command(self):
         effect = self.root / "late-side-effect"

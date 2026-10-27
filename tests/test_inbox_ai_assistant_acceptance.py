@@ -311,10 +311,19 @@ class BackgroundAndHistoryTests(support.AssistantFixture):
 
     def test_recent_questions_answers_scroll_after_refresh_selection_and_another_question(self):
         self.selected_items()
+        self.items[0]["log"]["last_reply"] = "SELECTED_AI_TASK_DETAILS"
+        self.items[1]["log"]["last_reply"] = "SELECTED_AI_SESSION_DETAILS"
         seen = set()
+        answer_lines = {"answer-line-{:03d}".format(n) for n in range(90)}
 
         def capture():
             seen.update(re.findall(r"answer-line-\d{3}|QUESTION_(?:FIRST|SECOND)", self.detail()))
+
+        def selected_details(sid, marker):
+            self.assertEqual(self.app.selected()["sid"], sid)
+            self.assertIn(marker, self.detail(), "selection restores the item's details")
+            self.assertNotRegex(self.detail(), r"answer-line-\d{3}|QUESTION_(?:FIRST|SECOND)|SECOND_ANSWER",
+                                "old questions and answers are reachable through L")
 
         def scroll_events():
             events = []
@@ -324,11 +333,17 @@ class BackgroundAndHistoryTests(support.AssistantFixture):
 
         self.reply("\n".join("answer-line-{:03d}".format(n) for n in range(90)))
         self.scenario(*self.ask("QUESTION_FIRST"), composer.Check(self.assert_idle),
-                      *scroll_events(), composer.Action(lambda: self.reply("SECOND_ANSWER")),
+                      *scroll_events(), composer.Action(lambda: self.assertEqual(seen, answer_lines | {"QUESTION_FIRST"})),
+                      composer.Action(lambda: self.reply("SECOND_ANSWER")),
                       *self.ask("QUESTION_SECOND"), composer.Check(self.assert_idle),
-                      composer.Action(seen.clear), "g", composer.Check(self.assert_idle), "jk", *scroll_events())
-        self.assertEqual(seen, {"answer-line-{:03d}".format(n) for n in range(90)} |
-                         {"QUESTION_FIRST", "QUESTION_SECOND"})
+                      composer.Action(seen.clear), "g", composer.Check(self.assert_idle),
+                      "j", composer.Action(lambda: selected_details("live-2222", "SELECTED_AI_SESSION_DETAILS")),
+                      "k", composer.Action(lambda: selected_details("live-1111", "SELECTED_AI_TASK_DETAILS")),
+                      "g", composer.Check(self.assert_idle),
+                      composer.Action(lambda: selected_details("live-1111", "SELECTED_AI_TASK_DETAILS")),
+                      "L", *scroll_events(), "\x1b",
+                      composer.Action(lambda: selected_details("live-1111", "SELECTED_AI_TASK_DETAILS")))
+        self.assertEqual(seen, answer_lines | {"QUESTION_FIRST", "QUESTION_SECOND"})
 
     def test_escape_terminates_owned_ai_and_descendant_discards_late_result_and_allows_retry(self):
         control = self.gated_ai(descendant=True)
