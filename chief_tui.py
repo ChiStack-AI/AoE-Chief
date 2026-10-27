@@ -526,6 +526,8 @@ class CommandExecution:
                 self.stop()  # Read-only AI descendants have no work after their worker exits.
             for thread in readers:
                 thread.join()
+            if self.cancelled.is_set():
+                self.wait_group_gone()
             self.events.put(("done", code))
         except Exception as exc:
             self.events.put(("error", str(exc)))
@@ -566,6 +568,19 @@ class CommandExecution:
             self.process.stdin.flush()
         except (OSError, ValueError):
             pass  # The completion event explains an exited worker.
+
+    def wait_group_gone(self, timeout=2.0):
+        """Pipes close before killed processes finish exiting; report a cancel only once the owned group is gone."""
+        process = getattr(self, "process", None)
+        if not process:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.005)
 
     def cancel(self):
         self.cancelled.set()
@@ -658,6 +673,8 @@ class QuestionExecution(CommandExecution):
         except Exception as exc:
             self.events.put(("ai_error", self.ch.inbox_ai_error(exc)))
         finally:
+            if self.cancelled.is_set():
+                self.wait_group_gone()
             self.events.put(("done", code))
             self.finished.set()
 
