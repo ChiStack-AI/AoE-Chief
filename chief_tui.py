@@ -138,9 +138,13 @@ def entry(ch, x):
         detail.append(("text", L("Goal: ", "目标：") + task["goal"]))
     for l, m, _ in sigs:
         detail.append((l, MARK.get(l, "   ") + " " + m))
+    if task.get("allowed"):
+        detail.extend(("text", line) for line in ch.allowed_change_lines(task, x.get("scope")))
     dec = x.get("decision")
     test_approval = bool(dec and dec.get("kind") == "test-approval" and dec.get("state", "pending") == "pending"
                          and ch.is_test_approval(task, dec.get("question")))
+    protected_approval = bool(dec and dec.get("kind") in ("protected-additions", "protected-state")
+                              and dec.get("state", "pending") == "pending" and not ch.in_test_phase(task))
     if dec:
         detail.append(("head", L("Decision {} ({}, by {})", "决策 {}（{}，{} 判断）").format(dec["id"], dec["size"], dec.get("by"))))
         detail.append(("text", L("Q: ", "问：") + (dec.get("question") or "")))
@@ -151,6 +155,18 @@ def entry(ch, x):
             detail.append(("text", L(
                 "r sends feedback and keeps the test phase; consent-looking replies ask for confirmation.",
                 "r 发送反馈并保留测试阶段；看似同意的回复会要求确认。")))
+        if protected_approval:
+            detail.append(("text", L(
+                "a approves these exact protected paths as deliverables." if dec["kind"] == "protected-additions" else
+                "a approves these protected paths at their exact current state/hash; further edits need renewed approval.",
+                "a 批准这些精确路径作为交付物。" if dec["kind"] == "protected-additions" else
+                "a 批准这些受保护路径的当前状态及哈希；后续修改需要重新批准。")))
+            detail.append(("text", L("r sends feedback without granting permission.", "r 发送反馈，不授予权限。")))
+            detail.append(("text", L("d dismisses without permission; violations remain red.", "d 关闭决策，不授权；违规保持红色。")))
+            if dec["kind"] == "protected-state":
+                for path in dec.get("files", []):
+                    state = (dec.get("snapshot") or {}).get(path) or {}
+                    detail.append(("text", "{}: {}".format(path, state.get("hash", "unverified"))))
         if dec.get("draft"):
             detail.append(("draft", L("Chief's draft: ", "chief 草稿：") + (dec.get("choice") or dec["draft"])))
         elif dec.get("why"):
@@ -184,6 +200,7 @@ def entry(ch, x):
             "level": lv, "headline": sigs[0][1] if sigs else (ft.get("conclusion") or ""),
             "decision": dec, "draft": bool(dec and dec.get("draft")),
             "test_approval": test_approval,
+            "protected_approval": protected_approval,
             "issues": bool(review and review.get("issues")), "detail": detail}
 
 def entries(ch, result):
@@ -194,8 +211,9 @@ def keys_for(ch, e):
     """The footer shows only the keys that do something for the selected entry."""
     L = ch.L
     k = []
-    if e and e["decision"] and (e["draft"] or e.get("test_approval")):
-        k.append(L("a approve tests", "a 批准测试") if e.get("test_approval") else L("a accept", "a 采纳"))
+    if e and e["decision"] and (e["draft"] or e.get("test_approval") or e.get("protected_approval")):
+        k.append(L("a approve tests", "a 批准测试") if e.get("test_approval") else
+                 L("a approve paths", "a 批准路径") if e.get("protected_approval") else L("a accept", "a 采纳"))
     if e and e["status"] != "missing":
         k.append(L("r reply", "r 回复"))       # a pending decision, a board task or any tracked session
     if e and e["decision"]:
@@ -1171,18 +1189,24 @@ class Inbox:
                      declined=L("{} closed; session stays archived; worktree and branch {} kept",
                                 "{} 已完成；会话继续归档；worktree 和分支 {} 保留").format(tid, branch))
 
-    def decision(self, e):
+    def decision(self, e, approval=False):
         d = self.ch.find_decision(e["decision"]["id"])
         if d["state"] != "pending":
             raise RuntimeError(self.ch.L("{} is already {}", "{} 已经是 {} 状态").format(d["id"], d["state"]))
+        if approval and e.get("protected_approval") and any(d.get(k) != e["decision"].get(k) for k in ("files", "snapshot")):
+            raise RuntimeError(self.ch.L("the protected changes were updated; refresh and review them",
+                                         "受保护改动已变化；请刷新并审查"))
         return d
 
     def accept_entry(self, e):
         ch, L = self.ch, self.ch.L
         approval = e.get("test_approval")
-        self.job(L("approving the acceptance tests", "批准验收测试") if approval else L("sending the draft", "发送草稿"),
-                 lambda: self.sent(ch.accept_decision(self.cfg, self.decision(e)),
+        protected = e.get("protected_approval")
+        self.job(L("approving the acceptance tests", "批准验收测试") if approval else
+                 L("approving protected paths", "批准受保护路径") if protected else L("sending the draft", "发送草稿"),
+                 lambda: self.sent(ch.accept_decision(self.cfg, self.decision(e, approval=True)),
                                    L("approved the acceptance tests", "已批准验收测试") if approval else
+                                   L("approved protected paths", "已批准受保护路径") if protected else
                                    L("sent chief's draft", "已发送 chief 的草稿")))
 
     def reply_entry(self, e, text):
@@ -1460,7 +1484,7 @@ class Inbox:
             self.refresh()
         elif k == "t":
             self.job(L("ticking", "tick 中"), lambda: "tick: " + ("; ".join(ch.tick(self.cfg)) or L("nothing to do", "无需处理")))
-        elif k == "a" and e and (e["draft"] or e.get("test_approval")):
+        elif k == "a" and e and (e["draft"] or e.get("test_approval") or e.get("protected_approval")):
             self.accept_entry(e)
         elif k == "r" and e and e["decision"]:      # answers the queued decision, and records how you answered
             self.ask(L("Reply to {}: ", "回复 {}：").format(e["decision"]["id"]),

@@ -194,8 +194,36 @@ worker may edit, add, delete or rename them during the test phase unless explici
 During implementation, new test files under protected directories appear as **yellow** review items, with
 their paths listed. Chief compares against the task's scope base, including committed, staged and untracked
 additions. Existing protected files changed or deleted remain **red**, including the source of a rename.
-Non-test additions under protected directories remain **red** during build. Explicitly approved test and
-support files remain protected.
+Non-test additions under protected directories remain **red** until explicitly allowed. This also applies to
+legacy tasks without a phase. Chief detects these changes in observe, suggest and auto modes, without a
+worker question, and keeps one aggregate request current:
+`New files in protected paths: <paths>. Allow them as task deliverables?`
+For example, `tests/fast.py` is a non-test deliverable according to the existing test filename rules.
+
+Use Inbox **`a approve paths`** (**`a 批准路径`**) or `chief decide <decision-id> --accept` even though there is no
+draft. Approval persists in the task contract's `allowed` list. An **addition** allowance permits continued
+editing of that exact normalized path, provided it did not exist at the task's scope base. It cannot cover
+directory descendants, siblings, baseline-existing files, or explicitly protected acceptance tests/support.
+
+Existing protected modifications, deletions and renames instead queue `Allow changes to protected <paths>?`.
+Accepting records each exact path's content hash, file mode, or explicit **deletion marker** (`deleted`). A
+**state** approval clears its violation only while that version still matches.
+Further edits need approval again and turn it red.
+Rename approval includes both source and destination, including moves outside protected directories; later
+changes to a moved-out file require approval again. Divergent staged and working versions must be reconciled
+before state approval, so an unchanged working copy cannot hide a different staged version.
+
+For both requests, **`r` / `--reply` is feedback only**, even for “approved” or “yes”; it grants no permission.
+**`d` / `--dismiss` grants no permission** and leaves violations red. Repeated passes do not duplicate a pending
+request, and a new transcript timestamp does not resolve it. Feedback/dismissal suppresses an identical request
+until its paths or contents change; reverting all requested changes retires the request without permission.
+Chief never drafts, auto-accepts or grants these exceptions, including with `--ai` or `--redraft`.
+
+Approved paths, approval types and matching/changed states appear in the worker brief, Inbox detail and cross
+review material, and are recorded on the review card for acceptance. Other red signals and scope boundaries
+still apply. Explicitly protected acceptance tests and support files require exact state approval; addition
+allowances never unlock them. This approval flow is disabled during the test phase, whose test exemptions,
+support-file review and explicit approval transition to build remain unchanged.
 
 The existing flag-based form also works, without AI drafting or a contract confirmation prompt:
 
@@ -296,8 +324,9 @@ The list separates **Delegated tasks** from tracked **Thinking sessions**, with 
 group. Arrow keys or j/k move between items and skip headings; refreshes retain the selected session.
 
 The footer shows only the keys that apply to the selected item: `a approve tests` / `a 批准测试` approves pending
-tests, locks the listed files plus discovered support files, and starts build; otherwise `a accept` / `a 采纳`
-accepts Chief's draft. The detail pane explains this approval action and that `r` sends feedback and keeps the
+tests, locks the listed files plus discovered support files, and starts build. `a approve paths` / `a 批准路径`
+explicitly allows protected deliverables or their exact changed state; `a accept` / `a 采纳` accepts Chief's draft.
+The detail pane explains these actions and that `r` sends feedback and keeps the
 test phase, with a confirmation for consent-only replies as described above. `r` replies to the pending
 decision if there is one, otherwise straight to the session: guidance for a board task, your words unchanged for a
 tracked session. `d` dismisses the decision, `n` sends the worker guidance, `b` sends the review issues back,
@@ -445,7 +474,7 @@ sessions and summarize them (`chief track <session>`), but it does not drive the
 | | `nudge <id> [TEXT] [--review]` | Send guidance or review issues back, and resume automation |
 | | `rotate <id>`, `review <id>` | Start a fresh session now; run a cross review now |
 | 📝 Decide | `decisions [--all] [--stats]` | The decision queue and acceptance stats |
-| | `decide <id> --accept \| --reply TEXT \| --dismiss [REASON]` | Approve tests and lock their support files, accept a draft, or send feedback; test-approval replies keep the test phase (`--redraft` / `--ai` re-judge it) |
+| | `decide <id> --accept \| --reply TEXT \| --dismiss [REASON]` | Approve tests/support, protected additions or exact changed states, accept a draft, or send feedback; replies/dismissals grant no protected-path permission. `--redraft` / `--ai` never draft protected-path approvals |
 | ⚙️ Settings | `engine [codex\|claude]`, `lang [en\|zh]` | AI engine and models per level; output language |
 
 For `task <id>`, `--parked` suppresses inactivity reports and `--unpark` enables them again.
