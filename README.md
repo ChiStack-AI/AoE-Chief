@@ -380,9 +380,20 @@ aoe add ~/aoe-chief -t "chief inbox" --tool chief --launch
 aoe add ~/aoe-chief -t "chief watch" --tool chief-watch --launch
 ```
 
-Then tasks keep moving without a terminal of yours open, and the AoE sidebar shows whether `watch` is alive. After
-updating Chief, restart these two with `aoe session stop` and `aoe session start`, not `aoe session restart`:
-restart types a wake message into the session, and the inbox would read its letters as keys.
+Then tasks keep moving without a terminal of yours open, and the AoE sidebar shows whether `watch` is alive.
+
+**Updating Chief:** pull, then restart both standing sessions with stop and start, not `aoe session restart`
+(restart types a wake message into the session, and the inbox would read its letters as keys):
+
+```bash
+git -C ~/aoe-chief pull
+aoe session stop <ID> && aoe session start <ID>   # once for the inbox, once for watch
+```
+
+**Changing `custom_agents`:** AoE stores a session's command when the session is created, so editing
+`config.toml` does not change existing sessions. Remove the old session (`aoe remove <ID>`) and run the matching
+`aoe add` again. A trashed session still blocks the same title and path, so use a new title (for example
+`chief console`) or empty the trash (`aoe session empty-trash` purges every trashed session and cannot be undone).
 
 **Thinking tasks** are open-ended conversations. You talk to the agent directly. Chief can still watch those
 sessions and summarize them (`chief track <session>`), but it does not drive them.
