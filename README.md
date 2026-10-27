@@ -283,18 +283,33 @@ Press `?` to open a one-line **AI question box**, including on an empty board. T
 `Enter` to submit it to your configured engine/model. The detail pane shows **thinking** while generation runs in
 the background; Up/Down navigation stays responsive. `Esc` dismisses an unsubmitted question or cancels active
 generation, terminating its owned process and descendants and discarding late results. Recent questions and
-answers remain available in this Inbox across refreshes and selection changes; `PgUp`/`PgDn` scroll them.
-After an answer, Esc returns to task details; `?` opens the question history again. History is kept for the latest
-12 questions in this Inbox and is not saved between launches.
+answers remain available in the combined log described below; `?` opens a new question bar.
+
+The **combined command and AI log** keeps the latest **20 submitted operations** in chronological submission
+order in memory for this Inbox process. Each nonblank `:` command or `?` question creates one entry, updated
+in place as it runs; the oldest entry is evicted at the limit. Entries retain command text, stdout/stderr,
+errors, cancellation and actual exit status when available, or the question, answer, localized error,
+cancellation and that answer's validated suggestions. The log survives refreshes and selection changes and
+is not saved between launches. Unsubmitted or blank input does not create an entry.
+
+A newly submitted operation shows its live result temporarily in the detail pane. Changing the selected item
+dismisses that result and restores the item's details; background updates and refreshes never reopen dismissed
+results. `Esc` also hides a completed result. Press uppercase `L` to open the combined log, even on an empty
+board, initially at the newest entry at the bottom. `PgUp`/`PgDn` and `Space` scroll it; `Esc` leaves the log
+without clearing it. Input, confirmations and active-operation cancellation keep precedence: during execution,
+the first Esc cancels the owned operation, and another Esc leaves the log. Reading or scrolling the log and
+pressing Enter there never submit an operation or send a reply.
 
 The assistant is instructed to use your language, put the conclusion first and give at most three supporting points. It gets
 explicit README/architecture documentation, the current board, pending decisions, recent events and review cards,
 redacted with Chief's existing secret masker and enclosed as untrusted data. Generation uses `read_files=False`;
-repository text and prior model answers cannot authorize actions or change Chief's rules.
+repository text and prior model answers cannot authorize actions or change Chief's rules. Command log contents
+are never included in AI context.
 
 When useful, an answer offers numbered **command suggestions**, checked against the existing command parser.
 Press `1`–`9` to select a suggestion and **prefill** the `:` command bar. You can edit it or cancel with Esc;
-only `Enter` submits the edited command, which is validated again. `close`, `clean`, `aoe session stop` and
+in the combined log these digits refer to the latest AI answer, while older answers retain their own suggestions.
+Only `Enter` submits the edited command, which is validated again. `close`, `clean`, `aoe session stop` and
 `aoe session archive` retain their `y/N` confirmations. Asking, receiving an answer and selecting a suggestion
 never execute commands, approve acceptance tests, resolve decisions or send replies. Unavailable engines,
 timeouts, failed generation and unusable responses show localized errors; press `?` and submit again to retry.
@@ -323,10 +338,11 @@ pending decision IDs. Archived sessions complete for `unarchive`, and trashed se
 Completion reads a background cache, so input stays responsive; if data is still loading, try Tab again.
 Up/Down recalls per-inbox command history and restores your unsubmitted draft. Ctrl-U clears the line;
 Backspace edits it. `Enter` submits once and runs the command in the background. Stdout, stderr, errors
-and exit status appear in the detail pane; PgUp/PgDn scroll output, which survives refresh and selection
-changes. `Esc` dismisses unsubmitted input or a confirmation. During execution it terminates the owned
-command process and its descendants, discarding late results. Already completed side effects are not undone.
-After completion, Esc hides the output so you can inspect the selected task again.
+and exit status update the operation's log entry and its transient detail view; PgUp/PgDn scroll output.
+After selection changes, use `L` to read retained output. `Esc` dismisses unsubmitted input or a confirmation.
+During execution it terminates the owned command process and its descendants, discarding late results.
+Already completed side effects are not undone.
+After completion, Esc returns to the selected task's details without removing the log entry.
 
 `close`, `clean`, `aoe session stop` and `aoe session archive` always require explicit `y/N` confirmation,
 including when flags such as `--force` or `--dry-run` are present. Enter, `n` and Esc decline. A clean's

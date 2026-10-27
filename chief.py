@@ -2570,22 +2570,32 @@ def argument_parser(parser_class=argparse.ArgumentParser):
     en.add_argument("name", nargs="?", choices=["codex", "claude"])
     inbox_help = L("Interactive inbox. '?' opens a one-line AI question box; Enter submits a nonempty question. "
                    "Thinking runs in the background with responsive navigation. Esc cancels input or AI generation "
-                   "and its owned process tree; late results are discarded. PgUp/PgDn scroll recent questions and "
-                   "answers across refreshes and selection changes. Keys 1-9 select a validated suggestion to prefill "
+                   "and its owned process tree; late results are discarded. Uppercase L opens the combined command "
+                   "and AI log, even on an empty board, at the newest entry at the bottom. It retains the latest 20 "
+                   "submissions in chronological order in memory for this Inbox process, with no persistence between launches. "
+                   "PgUp/PgDn and Space scroll; Esc leaves the log without clearing it. New submissions show a transient "
+                   "live result; changing selection dismisses it and restores item details. Background updates and refreshes "
+                   "do not reopen dismissed results. Input, confirmation and active cancellation keep precedence. "
+                   "Browsing the log or pressing Enter there never submits an operation. Command log contents never enter AI context. "
+                   "Keys 1-9 select a validated suggestion from the visible answer (latest AI answer in the log) to prefill "
                    "the ':' bar: edit it, then Enter submits; selection never executes. AI unavailable, timeout, "
                    "failed generation or unusable responses show errors; press ? to retry. "
                    "':' opens a restricted command bar (optional chief prefix; aoe list or "
                    "aoe session show/start/stop/archive/unarchive/restore). Tab completes commands and IDs; "
                    "Up/Down recalls history. Enter runs in the background. Esc cancels an owned command process; "
                    "completed side effects are not undone. Close, clean, stop and archive require y/N confirmation. "
-                   "Output stays in the scrollable detail pane. Use chief console for an interactive shell.",
+                   "Output remains in its log entry. Use chief console for an interactive shell.",
                    "交互收件箱。'?' 打开一行 AI 提问框，Enter 提交非空问题。后台思考时仍可选择会话；"
-                   "Esc 取消输入或 AI 生成并终止所属进程树，丢弃过期结果。PgUp/PgDn 滚动最近问答，刷新和切换选择后保留。"
-                   "1-9 选择验证过的命令建议，预填 ':' 命令栏；可编辑，必须 Enter 才提交，选择不会执行。"
+                   "Esc 取消输入或 AI 生成并终止所属进程树，丢弃过期结果。大写 L 打开命令与 AI 问答的统一日志，"
+                   "空看板也可打开，初始滚动到最新条目的底部。按提交顺序在本次进程内存中保留最新 20 条，退出后不保存。"
+                   "PgUp/PgDn 和 Space 滚动，Esc 离开日志但不清空。新提交的操作临时显示实时结果；切换选择后隐藏结果并恢复条目详情，"
+                   "后台更新和刷新不会重新打开已隐藏的结果。输入、确认和活动操作取消保持优先级。浏览日志或在其中按 Enter 不会提交操作，"
+                   "命令日志不会加入 AI 上下文。"
+                   "1-9 选择验证过的命令建议（日志中对应最新 AI 回答），预填 ':' 命令栏；可编辑，必须 Enter 才提交，选择不会执行。"
                    "AI 不可用、超时、生成失败或回答无效会显示错误；按 ? 重新提交以重试。"
                    "':' 打开受限命令栏（chief 前缀可省略；支持 aoe list 及指定 session 命令）。"
                    "Tab 补全命令和 ID，↑↓ 浏览历史，Enter 后台运行，Esc 终止命令进程（已完成操作不会撤销）。"
-                   "关闭、清理、停止和归档需要 y/N 确认。输出保留在可滚动详情中；交互 shell 请用 chief console。")
+                   "关闭、清理、停止和归档需要 y/N 确认。输出保留在日志条目中；交互 shell 请用 chief console。")
     ib = sub.add_parser("inbox", help=L("interactive inbox with ':' commands", "交互收件箱，支持 ':' 命令"),
                         description=inbox_help)
     ib.add_argument("--every", type=int, default=15, help=L("refresh interval in seconds (default 15; checks never run here)",

@@ -26,6 +26,7 @@ import unicodedata
 
 MARK = {"red": "[!]", "draft": "[?]", "green": "[+]", "yellow": "[~]", "grey": "[ ]"}
 ORDER = ("red", "draft", "green", "yellow", "grey")
+LOG_LIMIT = 20
 
 # ---------- Text width (CJK characters take two cells) ----------
 
@@ -197,7 +198,7 @@ def keys_for(ch, e):
         k.append(L("c close", "c 验收"))
     if e:
         k.append(L("o open", "o 进入"))
-    return [L("N new task", "N 新任务"), L("? ask AI", "? 问 AI")] + k + [L(": command", ": 命令"), L("t tick", "t tick"),
+    return [L("N new task", "N 新任务"), L("? ask AI", "? 问 AI"), L("L log", "L 日志")] + k + [L(": command", ": 命令"), L("t tick", "t tick"),
                                               L("g refresh", "g 刷新"), L("q quit", "q 退出")]
 
 # ---------- Rendering: state → rows of (text, style) segments ----------
@@ -211,6 +212,36 @@ def input_row(prompt, buf, w, active=True):
         tail, cells = c + tail, cells + cell(c)
     return [(fit(prompt, pw), "prompt" if active else "dim"),
             (fit(tail, w - pw), "text" if active else "dim")]
+
+def terminal_text(text):
+    return "".join(c for c in str(text) if c in "\n\t" or c.isprintable())
+
+def suggestion_turn(st):
+    """Digits refer to the latest AI turn in the log, or the visible AI result."""
+    if st.get("log_visible"):
+        return next((turn for turn in reversed(st.get("log", [])) if turn["kind"] == "ai"), None)
+    turn = st.get("transient_result")
+    return turn if turn and turn["kind"] == "ai" else None
+
+def operation_detail(ch, turn, selectable=True):
+    L = ch.L
+    if turn["kind"] == "command":
+        detail = [("head", "$ " + turn["command"]), ("text", turn.get("output", ""))]
+    else:
+        detail = [("head", L("Q: ", "问：") + turn["question"])]
+        if turn.get("answer"):
+            detail.append(("text", turn["answer"]))
+    if turn.get("error"):
+        detail.append(("red", turn["error"]))
+    if turn.get("cancelled"):
+        detail.append(("info", turn.get("cancel_note") or L("Cancelled", "已取消")))
+    if turn.get("exit_status") is not None:
+        detail.append(("info", L("[exit status {}]", "[退出码 {}]").format(turn["exit_status"])))
+    for i, command in enumerate(turn.get("suggestions", []), 1):
+        label = (L("{} prefill : {}", "{} 预填 : {}").format(i, command) if selectable else
+                 L("Suggested : {}", "曾建议 : {}").format(command))
+        detail.append(("draft", label))
+    return detail
 
 def render(ch, st, w, h):
     L, es = ch.L, st.get("entries") or []
@@ -271,8 +302,14 @@ def render(ch, st, w, h):
         rows.append(segs)
         shown += 1
     e = es[sel] if es else None
+    transient = st.get("transient_result")
+    log_visible = st.get("log_visible")
+    turn = suggestion_turn(st)
+    suggestions = turn.get("suggestions", []) if turn else []
     title = (L("New task contract", "新任务合同") if new else
-             L("AI questions", "AI 问答") if st.get("ai_visible") and st.get("command_output") is None else
+             L("Command and AI log", "命令与 AI 日志") if log_visible else
+             L("AI question", "AI 问答") if transient and transient["kind"] == "ai" else
+             L("Command result", "命令结果") if transient else
              e["title"] if e else "")
     bar = "── " + fit(title, max(0, w - 8)).rstrip() + " " if title else ""
     rows.append([(fit(bar + "─" * max(0, w - width(bar)), w), "dim")])
@@ -297,21 +334,15 @@ def render(ch, st, w, h):
             detail.append(("text", json.dumps(new["contract"], ensure_ascii=False, indent=2)))
         else:
             detail.append(("text", L("Task intent: ", "任务意图：") + new.get("intent", "")))
-    elif st.get("command_output") is not None:
-        detail = [("text", st["command_output"])]
-    elif st.get("ai_visible"):
+    elif log_visible:
         detail = []
-        for turn in st.get("questions", []):
-            detail.append(("head", L("Q: ", "问：") + turn["question"]))
-            if turn.get("answer"):
-                detail.append(("text", turn["answer"]))
-            if turn.get("error"):
-                detail.append(("red", turn["error"]))
-            if turn.get("cancelled"):
-                detail.append(("info", L("Cancelled", "已取消")))
+        for operation in st.get("log", []):
+            detail.extend(operation_detail(ch, operation, selectable=operation is turn))
             detail.append(("text", ""))
-        for i, command in enumerate(st.get("ai_suggestions", []), 1):
-            detail.append(("draft", L("{} prefill : {}", "{} 预填 : {}").format(i, command)))
+        if not detail:
+            detail = [("info", L("No commands or AI questions submitted yet.", "尚未提交命令或 AI 问题。"))]
+    elif transient:
+        detail = operation_detail(ch, transient)
     for style, text in detail:
         for line in wrap(text, max(10, w - 2), " "):
             body.append((style, line))
@@ -339,7 +370,7 @@ def render(ch, st, w, h):
         if st.get("busy"):
             msg = "{} {}… ({}s)".format("-\\|/"[int(st.get("now", 0)) % 4], st["busy"], max(0, int(st.get("now", 0) - st.get("busy_since", 0))))
         rows.append([(fit(" " + msg, w), "msg")])
-    more = L(" PgUp/PgDn scroll", " PgUp/PgDn 滚动") if len(body) > body_h else ""
+    more = L(" PgUp/PgDn/Space scroll", " PgUp/PgDn/Space 滚动") if len(body) > body_h else ""
     keys = "  ".join(keys_for(ch, e)) + L("  ↑↓ move", "  ↑↓ 选择")
     if command_bar:
         keys = L("Tab complete  ↑↓ history  Enter run  Esc cancel", "Tab 补全  ↑↓ 历史  Enter 运行  Esc 取消")
@@ -347,17 +378,30 @@ def render(ch, st, w, h):
             keys = "Tab  ↑↓  Enter  Esc"
     elif question_box:
         keys = L("Enter ask  Esc cancel", "Enter 提问  Esc 取消")
-    elif st.get("ai_thinking"):
-        keys = L("Esc cancel AI  ↑↓ move", "Esc 取消 AI  ↑↓ 选择")
-    elif st.get("command_prompt"):
-        keys = L("Enter create  e edit  n abort  Esc cancel", "Enter 创建  e 编辑  n 取消  Esc 取消")
     elif st.get("confirm"):
         keys = L("y confirm  Enter/n/Esc decline", "y 确认  Enter/n/Esc 取消")
-    elif st.get("busy") and st.get("command_output") is not None:
-        keys = L("Esc cancel command  ↑↓ move  PgUp/PgDn scroll", "Esc 取消命令  ↑↓ 选择  PgUp/PgDn 滚动")
-    elif st.get("ai_visible"):
-        keys = (L("1-9 prefill :  ? ask  Esc hide", "1-9 预填 :  ? 提问  Esc 隐藏") if st.get("ai_suggestions") else
-                L("? ask  Esc hide  ↑↓ move", "? 提问  Esc 隐藏  ↑↓ 选择"))
+    elif log_visible:
+        escape = L("Esc back", "Esc 返回")
+        if st.get("ai_thinking"):
+            escape = L("Esc cancel AI", "Esc 取消 AI")
+        elif st.get("busy") and any(t.get("running") for t in st.get("log", [])):
+            escape = L("Esc cancel command", "Esc 取消命令")
+        keys = L("L log  {}  latest {} in memory  PgUp/PgDn/Space scroll",
+                 "L 日志  {}  本次内存最新 {} 条  PgUp/PgDn/Space 滚动").format(escape, LOG_LIMIT)
+        if suggestions:
+            keys += L("  1-9 prefill latest AI :", "  1-9 预填最新 AI 建议 :")
+        more = ""
+    elif st.get("ai_thinking"):
+        keys = L("Esc cancel AI  L log  ↑↓ item details", "Esc 取消 AI  L 日志  ↑↓ 选择恢复详情")
+    elif st.get("command_prompt"):
+        keys = L("Enter create  e edit  n abort  Esc cancel  L log", "Enter 创建  e 编辑  n 取消  Esc 取消  L 日志")
+    elif st.get("busy") and any(t.get("running") for t in st.get("log", [])):
+        keys = L("Esc cancel command  L log  ↑↓ item details", "Esc 取消命令  L 日志  ↑↓ 选择恢复详情")
+    elif transient:
+        keys = L("L log  : command  ? ask  Esc hide  ↑↓ item details", "L 日志  : 命令  ? 提问  Esc 隐藏  ↑↓ 选择恢复详情")
+        if suggestions:
+            keys = L("L log  1-9 prefill :  ? ask  Esc hide  ↑↓ item details",
+                     "L 日志  1-9 预填 :  ? 提问  Esc 隐藏  ↑↓ 选择恢复详情")
     if new:
         if new["phase"] == "intent":
             keys = (L("↑↓ line  Enter draft  Tab complete path  Esc cancel", "↑↓ 切换行  Enter 起草  Tab 补全路径  Esc 取消")
@@ -446,6 +490,7 @@ class CommandExecution:
         self.request = request
         self.events = queue.Queue()
         self.cancelled = threading.Event()
+        self.finished = threading.Event()
         self.process = None
 
     def start(self):
@@ -479,12 +524,14 @@ class CommandExecution:
             self.events.put(("done", code))
         except Exception as exc:
             self.events.put(("error", str(exc)))
-            self.events.put(("done", 1))
+            self.stop()
+            self.events.put(("done", self.process.poll() if self.process else None))
         finally:
             if self.process:
                 for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
                     if stream:
                         stream.close()
+            self.finished.set()
 
     def read(self, stream, channel):
         try:
@@ -542,7 +589,8 @@ class CommandExecution:
 class Inbox:
     def __init__(self, cfg, ch, every):
         self.cfg, self.ch, self.every = cfg, ch, max(5, every)
-        self.st = {"entries": [], "sel": 0, "scroll": 0, "msg": "", "busy": None, "input": None, "confirm": None}
+        self.st = {"entries": [], "sel": 0, "scroll": 0, "msg": "", "busy": None, "input": None, "confirm": None,
+                   "log": [], "log_visible": False, "transient_result": None}
         self.last_refresh = 0
         self.lock = threading.Lock()
         self.current_repo = os.path.realpath(os.getcwd())
@@ -553,6 +601,7 @@ class Inbox:
         self.closed_tasks = queue.Queue()
         self.validation_thread = None
         self.execution = None
+        self.cancelled_commands = []
         self.command_history = []
         self.history_index = 0
         self.history_draft = ""
@@ -561,27 +610,46 @@ class Inbox:
         self.ai_execution = None
         self.board_result = {}
 
+    def log_operation(self, kind, text):
+        turn = {"kind": kind, "question" if kind == "ai" else "command": terminal_text(text)}
+        self.st["log"].append(turn)
+        del self.st["log"][:-LOG_LIMIT]
+        self.st.update(transient_result=turn, log_visible=False, scroll=0)
+        return turn
+
+    def dismiss_result(self):
+        self.st["transient_result"] = None
+        if not self.st["log_visible"]:
+            self.st["scroll"] = 0
+
+    def select(self, index):
+        before = self.selected()
+        self.st["sel"] = max(0, min(len(self.st["entries"]) - 1, index))
+        after = self.selected()
+        if (before or {}).get("sid") != (after or {}).get("sid"):
+            self.dismiss_result()
+        elif not self.st["log_visible"]:
+            self.st["scroll"] = 0
+
     def open_question(self):
-        self.st.pop("command_output", None)
-        self.st["ai_visible"] = True
         self.st["input"] = {"prompt": self.ch.L("? Question: ", "? 问题："), "buf": "",
                             "then": self.submit_question, "empty": False, "question": True}
 
     def submit_question(self, text):
+        # Only prior AI turns enter context; never copy the combined command log.
+        recent = copy.deepcopy([{key: turn[key] for key in ("question", "answer", "error", "cancelled") if key in turn}
+                                for turn in self.st["log"] if turn["kind"] == "ai"][-6:])
+        turn = self.log_operation("ai", self.ch.redact(text))
         if not self.lock.acquire(blocking=False):
             self.st["msg"] = self.ch.L("busy; press ? to retry", "忙；按 ? 重试")
+            turn["error"] = self.st["msg"]
             return
-        turn = {"question": self.ch.redact(text)}
-        history = self.st.setdefault("questions", [])
-        recent = copy.deepcopy(history[-6:])
-        history.append(turn)
-        del history[:-12]
         cfg, result, lang = copy.deepcopy(self.cfg), copy.deepcopy(self.board_result), self.ch.LANG
         execution = CommandExecution([sys.executable, str(Path(self.ch.__file__).resolve()), "_inbox_ai_worker"],
             protocol=True, request=lambda: question_request(self.ch, cfg, text, result, recent, lang))
         execution.turn, execution.response, execution.ai_error = turn, None, None
         self.ai_execution = execution
-        self.st.update(ai_visible=True, ai_thinking=True, ai_suggestions=[], scroll=10 ** 9,
+        self.st.update(ai_thinking=True, scroll=10 ** 9,
                        busy=self.ch.L("thinking", "思考中"), busy_since=time.time())
         try:
             execution.start()
@@ -615,7 +683,9 @@ class Inbox:
                 execution.ai_error = "failed"
             elif kind == "done":
                 self.ai_execution = None
-                self.st.update(busy=None, ai_thinking=False, scroll=10 ** 9)
+                self.st.update(busy=None, ai_thinking=False)
+                if self.st.get("transient_result") is execution.turn:
+                    self.st["scroll"] = 10 ** 9
                 self.lock.release()
                 if not data and not execution.ai_error:
                     try:
@@ -633,7 +703,7 @@ class Inbox:
                             if len(suggestions) == 9:
                                 break
                         execution.turn["answer"] = response["answer"]
-                        self.st["ai_suggestions"] = suggestions
+                        execution.turn["suggestions"] = suggestions
                     except (ValueError, TypeError):
                         execution.ai_error = "unusable"
                 else:
@@ -650,7 +720,7 @@ class Inbox:
         # Detach first. Old queues (including late launch errors) are never polled again.
         execution.turn["cancelled"] = True
         execution.cancel()
-        self.st.update(busy=None, ai_thinking=False, ai_suggestions=[], msg=self.ch.L("cancelled", "已取消"))
+        self.st.update(busy=None, ai_thinking=False, msg=self.ch.L("cancelled", "已取消"))
         self.lock.release()
 
     def open_command(self):
@@ -661,34 +731,38 @@ class Inbox:
 
     def submit_command(self, text):
         self.command_history.append(text)
-        self.st.update(command_output="$ " + text + "\n", scroll=0, ai_visible=False)
+        turn = self.log_operation("command", text)
+        turn["output"] = ""
         try:
             target, argv = self.ch.parse_inbox_command(text)
         except (ValueError, TypeError) as exc:
-            self.st["command_output"] += self.ch.L("Error: ", "错误：") + str(exc) + "\n"
+            turn["error"] = self.ch.L("Error: ", "错误：") + terminal_text(exc)
             return
         dangerous = (target == "chief" and argv[0] in ("close", "clean") or
                      target == "aoe" and argv[:2] in (["session", "stop"], ["session", "archive"]))
         if dangerous:
             label = " ".join((["aoe"] if target == "aoe" else []) + argv)
-            self.confirm(label + "? (y/N)", lambda: self.start_command(target, argv))
+            self.confirm(terminal_text(label) + "? (y/N)", lambda: self.start_command(target, argv, turn))
+            self.st["confirm"]["declined_then"] = lambda: turn.update(cancelled=True)
         else:
-            self.start_command(target, argv)
+            self.start_command(target, argv, turn)
 
-    def start_command(self, target, argv):
+    def start_command(self, target, argv, turn):
         if not self.lock.acquire(blocking=False):
             self.st["msg"] = self.ch.L("busy", "忙")
-            self.st["command_output"] += self.ch.L("Error: busy; retry when the current action finishes.\n",
-                                                   "错误：忙；当前操作完成后请重试。\n")
+            turn["error"] = self.ch.L("Error: busy; retry when the current action finishes.",
+                                      "错误：忙；当前操作完成后请重试。")
             return
-        command = ([sys.executable, str(Path(self.ch.__file__).resolve()), "_inbox_worker"] + argv
-                   if target == "chief" else [self.ch.aoe_bin(), "-p", self.cfg["profile"]] + argv)
-        self.execution = CommandExecution(command, protocol=target == "chief")
-        self.st.update(busy=self.ch.L("running command", "运行命令"), busy_since=time.time(), command_prompt=None)
         try:
+            command = ([sys.executable, str(Path(self.ch.__file__).resolve()), "_inbox_worker"] + argv
+                       if target == "chief" else [self.ch.aoe_bin(), "-p", self.cfg["profile"]] + argv)
+            self.execution = CommandExecution(command, protocol=target == "chief")
+            self.execution.turn = turn
+            turn["running"] = True
+            self.st.update(busy=self.ch.L("running command", "运行命令"), busy_since=time.time(), command_prompt=None)
             self.execution.start()
         except Exception as exc:
-            self.st["command_output"] += self.ch.L("Error: ", "错误：") + str(exc) + "\n"
+            turn.update(running=False, error=self.ch.L("Error: ", "错误：") + terminal_text(exc))
             self.execution = None
             self.st["busy"] = None
             self.lock.release()
@@ -699,6 +773,16 @@ class Inbox:
             self.execution.answer(answer)
 
     def poll_command(self):
+        # Cancelled queues stay detached. Only the owned process's actual exit
+        # code may still update its entry, never buffered output or UI visibility.
+        pending = []
+        for cancelled in self.cancelled_commands:
+            process = cancelled.process
+            if process and process.poll() is not None:
+                cancelled.turn["exit_status"] = process.returncode
+            elif not cancelled.finished.is_set():
+                pending.append(cancelled)
+        self.cancelled_commands = pending
         execution = self.execution
         if not execution:
             return
@@ -708,15 +792,14 @@ class Inbox:
             except queue.Empty:
                 break
             if kind in ("stdout", "stderr", "error"):
-                text = str(data)
-                text = "".join(c for c in text if c in "\n\t" or c.isprintable())
-                self.st["command_output"] += (self.ch.L("\nError: ", "\n错误：") if kind == "error" else "") + text
+                execution.turn["output"] += (self.ch.L("\nError: ", "\n错误：") if kind == "error" else "") + terminal_text(data)
             elif kind == "prompt":
-                self.st["scroll"] = 10 ** 9  # Review the newest contract/candidate list.
+                if self.st["log_visible"] or self.st.get("transient_result") is execution.turn:
+                    self.st["scroll"] = 10 ** 9  # Review the newest contract/candidate list.
                 if data["contract"]:
-                    self.st["command_prompt"] = data["text"]
+                    self.st["command_prompt"] = terminal_text(data["text"])
                 else:
-                    self.confirm(data["text"], lambda: self.command_answer("y"))
+                    self.confirm(terminal_text(data["text"]), lambda: self.command_answer("y"))
                     self.st["confirm"].update(command=True, declined_then=lambda: self.command_answer("n"))
             elif kind == "editor":
                 self.command_editor = data
@@ -725,7 +808,7 @@ class Inbox:
                 self.st.update(busy=None, command_prompt=None)
                 if self.st.get("confirm", {}) and self.st["confirm"].get("command"):
                     self.st["confirm"] = None
-                self.st["command_output"] += self.ch.L("\n[exit status {}]\n", "\n[退出码 {}]\n").format(data)
+                execution.turn.update(running=False, exit_status=data)
                 self.lock.release()
 
                 def reload_config():
@@ -739,12 +822,13 @@ class Inbox:
         execution, self.execution = self.execution, None
         if not execution:
             return
+        execution.turn.update(running=False, cancelled=True, cancel_note=self.ch.L(
+            "Cancelled: terminating owned process; already completed side effects remain.",
+            "已取消：正在终止所属进程；已完成操作保留。"))
         execution.cancel()
+        self.cancelled_commands.append(execution)
         self.command_editor = None
         self.st.update(busy=None, command_prompt=None, confirm=None)
-        self.st["command_output"] += self.ch.L(
-            "\nCancelled: terminating owned process; already completed side effects remain.\n",
-            "\n已取消：正在终止所属进程；已完成操作保留。\n")
         self.st["msg"] = self.ch.L("cancelled", "已取消")
         self.lock.release()
 
@@ -759,7 +843,7 @@ class Inbox:
             curses.endwin()
             status = subprocess.call(request["argv"] + [request["path"]])
         except (OSError, KeyboardInterrupt) as exc:
-            self.st["command_output"] += "\n" + str(exc) + "\n"
+            execution.turn["output"] += "\n" + terminal_text(exc) + "\n"
         finally:
             curses.reset_prog_mode()
             scr.clear()
@@ -909,6 +993,8 @@ class Inbox:
             sel = next((i for i, e in enumerate(es) if e["sid"] == cur["sid"]), sel)
         self.st.update(entries=es, sel=sel, empty=self.ch.L("Nothing tracked yet: N to delegate, or chief.py track <ID>",
                                                          "还没有跟踪任何会话：按 N 委派任务，或 chief.py track <ID>"))
+        if (cur or {}).get("sid") != (self.selected() or {}).get("sid"):
+            self.dismiss_result()
         # All filesystem/AoE completion loading happens in the refresh job, never
         # in a key handler. Persisted records include archives and trash.
         records = getattr(self.ch, "aoe_records", lambda cfg: {})(self.cfg)
@@ -1164,7 +1250,6 @@ class Inbox:
 
     def key(self, k):
         ch, L, e = self.ch, self.ch.L, self.selected()
-        es = self.st["entries"]
         new = self.st.get("new_task")
         if self.ai_execution:
             if k in ("\x1b", "q"):
@@ -1176,6 +1261,11 @@ class Inbox:
         if self.execution and k == "\x1b":
             self.cancel_command()
             return True
+        if k == "L" and not new:
+            self.st.update(log_visible=True, transient_result=None, scroll=10 ** 9)
+            return True
+        if self.st["log_visible"] and not new and k in ("\n", "\r", "KEY_ENTER"):
+            return True  # Browsing the log cannot approve a waiting contract.
         if self.st.get("command_prompt"):
             if k in ("\n", "\r", "KEY_ENTER"):
                 self.command_answer("")
@@ -1195,9 +1285,9 @@ class Inbox:
             if not self.st["busy"]:
                 self.open_question()
             return True
-        if (len(k) == 1 and k in "123456789" and self.st.get("ai_visible") and not new
+        if (len(k) == 1 and k in "123456789" and suggestion_turn(self.st) and not new
                 and not self.execution and not self.st["busy"]):
-            suggestions = self.st.get("ai_suggestions", [])
+            suggestions = suggestion_turn(self.st).get("suggestions", [])
             index = int(k) - 1
             if index < len(suggestions):
                 self.open_command()
@@ -1224,9 +1314,9 @@ class Inbox:
             if k not in ("KEY_DOWN", "j", "KEY_UP", "k", "KEY_NPAGE", " ", "KEY_PPAGE"):
                 return True
         if k in ("KEY_DOWN", "j"):
-            self.st.update(sel=max(0, min(len(es) - 1, self.st["sel"] + 1)), scroll=0)
+            self.select(self.st["sel"] + 1)
         elif k in ("KEY_UP", "k"):
-            self.st.update(sel=max(0, self.st["sel"] - 1), scroll=0)
+            self.select(self.st["sel"] - 1)
         elif k in ("KEY_NPAGE", " "):
             self.st["scroll"] += 5
         elif k == "KEY_PPAGE":
@@ -1235,11 +1325,9 @@ class Inbox:
             if self.execution:
                 self.cancel_command()
             return False
-        elif k == "\x1b" and self.st.get("command_output") is not None:
-            self.st.pop("command_output", None)
-        elif k == "\x1b" and self.st.get("ai_visible"):
-            self.st["ai_visible"] = False
-            self.st["scroll"] = 0
+        elif k == "\x1b" and (self.st["log_visible"] or self.st.get("transient_result")):
+            self.st["log_visible"] = False
+            self.dismiss_result()
         elif k == "g":
             self.refresh()
         elif k == "t":
