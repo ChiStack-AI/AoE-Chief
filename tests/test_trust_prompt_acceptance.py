@@ -13,6 +13,12 @@ QUESTIONS = (
     "Do you trust the files in this folder",
     CLAUDE_QUESTION,
 )
+QUESTION_FRAMES = (
+    "│ {} │",
+    "  │  {}  │  ",
+    "┃ {} ┃",
+    "  ┃  {}  ┃  ",
+)
 READY = "Ask Codex to do anything\n"
 
 
@@ -86,6 +92,23 @@ class TrustPromptAcceptanceTests(unittest.TestCase):
                 result = self.wait([trust_screen(question), READY])
                 self.assertEqual(self.answers, [1], "the affirmative trust option must be confirmed")
                 self.assertEqual(result, "ready")
+
+    def test_regex_recognizes_supported_questions_inside_box_drawing_borders(self):
+        for question in QUESTIONS:
+            for frame in QUESTION_FRAMES:
+                line = frame.format(question)
+                with self.subTest(line=line):
+                    self.assertIsNotNone(chief.TRUST_RE.search("Workspace\n" + line + "\n"))
+
+    def test_enabled_trust_answers_supported_questions_inside_box_drawing_borders(self):
+        for question in QUESTIONS:
+            for frame in QUESTION_FRAMES:
+                line = frame.format(question)
+                with self.subTest(line=line):
+                    selected = 2 if question == CLAUDE_QUESTION else 1
+                    result = self.wait([trust_screen(line, selected=selected), READY], selected=selected)
+                    self.assertEqual(self.answers, [1], "framed prompts must confirm affirmative trust")
+                    self.assertEqual(result, "ready")
 
     def test_new_claude_prompt_explicitly_selects_yes_when_no_is_highlighted(self):
         result = self.wait([trust_screen(CLAUDE_QUESTION, selected=2), READY], selected=2)
