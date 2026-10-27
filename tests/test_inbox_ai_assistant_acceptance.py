@@ -306,7 +306,10 @@ class BackgroundAndHistoryTests(support.AssistantFixture):
                       "k", composer.Action(lambda: self.assertEqual(self.app.selected()["sid"], "live-1111")),
                       "\n\r", (tui.curses.KEY_ENTER,), "?",
                       composer.Action(lambda: Path(control["release"]).touch()),
-                      self.answered_with("BACKGROUND_ANSWER"))
+                      composer.Check(self.assert_idle),
+                      composer.Action(lambda: self.assertIn(chief.load_task("task-alpha")["goal"], self.detail())),
+                      composer.Action(lambda: self.assertNotIn("BACKGROUND_ANSWER", self.detail())),
+                      "L", self.answered_with("BACKGROUND_ANSWER"))
         self.assertEqual(len(self.ai_calls()), 1)
 
     def test_recent_questions_answers_scroll_after_refresh_selection_and_another_question(self):

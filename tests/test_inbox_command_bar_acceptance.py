@@ -460,7 +460,10 @@ class BackgroundAndCancellationTests(support.CommandFixture):
                       "k", composer.Action(lambda: self.assertEqual(self.app.selected()["sid"], "live-1111")),
                       "\n\r", (tui.curses.KEY_ENTER,),
                       composer.Action(lambda: Path(rule["release"]).touch()),
-                      self.completed("stdout before gate", "stderr before gate", "stdout after gate"),
+                      composer.Check(self.assert_idle),
+                      composer.Action(lambda: self.assertIn(chief.load_task("task-alpha")["goal"], self.detail())),
+                      composer.Action(lambda: self.assertNotRegex(self.detail(), r"stdout (?:before|after) gate|stderr before gate")),
+                      "L", self.completed("stdout before gate", "stderr before gate", "stdout after gate"),
                       composer.Action(lambda: self.assertRegex(self.detail().lower(), r"(?:exit|status|code|failed).*7")))
         self.assertEqual(self.aoe_args().count(rule["argv"]), 1)
 
