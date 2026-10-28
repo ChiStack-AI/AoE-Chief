@@ -34,6 +34,13 @@ sessions:
 - It only interrupts you when a human decision is really needed.
 - Its reports are **thin first, thick on demand**: one line per thing that matters, details when you ask.
 
+The inbox during the demo below, captured from a real run. Chief has drafted an answer to the worker's question,
+and `a` sends it:
+
+<p align="center">
+  <img src="docs/assets/inbox.svg" alt="AoE Chief inbox: the demo task waits on a decision that Chief has drafted" width="820">
+</p>
+
 An illustrative brief:
 
 ```text
@@ -125,16 +132,26 @@ git clone https://github.com/lialittis/AoE-Chief.git ~/aoe-chief
 alias chief="python3 ~/aoe-chief/chief.py"
 chief init
 
-# Teach your agents the closing-block protocol. Merge it into existing files if you have them.
-cp ~/aoe-chief/rules/communication.md ~/.claude/CLAUDE.md
-cp ~/aoe-chief/rules/communication.md ~/.codex/AGENTS.md
+# Teach your agents the closing-block protocol. This appends, so existing instructions are kept.
+mkdir -p ~/.claude ~/.codex
+cat ~/aoe-chief/rules/communication.md >> ~/.claude/CLAUDE.md
+cat ~/aoe-chief/rules/communication.md >> ~/.codex/AGENTS.md
 ```
 
-### 🎮 Try the demo (about 5 minutes)
+### 🎮 Try the demo (about 6 minutes)
 
 `demo.sh` creates a small shop library with three bugs and delegates it to Codex. The worker is told to fix one
-test per turn and to ask before choosing the receipt format. So you get to see auto-continue, a drafted decision
-and a cross review. The demo state lives in its own directory, so your real board stays clean.
+test per turn and to ask before choosing the receipt format. The demo state lives in its own directory, so your real
+board stays clean.
+
+What you will see, in order:
+
+1. **Test approval** (🔴): the worker first strengthens the acceptance tests and asks you to approve them. Press `a`.
+2. **Auto-continue**: the worker fixes one test per turn, and Chief sends the remaining failures back each time.
+3. **A drafted decision** (📝): the worker asks "plain text or JSON?" and Chief drafts the answer. Press `a` to send
+   it, or `r` to reply with your own.
+4. **Cross review** (✅): once the checks pass, a second model reviews the diff and writes a review card. Accept with
+   `c` then `y` in the inbox, or `chief close shop-demo`.
 
 ```bash
 ~/aoe-chief/demo.sh
@@ -632,7 +649,7 @@ only immutable commit data is cached. Real engines, command workers and process-
 - [x] **Secret masking** at ingestion
 - [x] A test suite in the repository (`python3 -m unittest discover -s tests`)
 - [x] Inbox: `N` to delegate a task in one line, and separate groups for delegated and thinking work
-- [ ] Recognise Claude's newer trust prompt
+- [x] Recognise Claude's and Codex's newer trust prompts; report Codex's startup update menu without touching it
 
 The design rationale is in [docs/architecture.md](docs/architecture.md).
 
