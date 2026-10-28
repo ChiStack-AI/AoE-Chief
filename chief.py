@@ -857,6 +857,13 @@ def scope_info(path, task, extra_ignore=()):
             state = current_state(os.path.join(path, name))
             valid = (name not in violations if name in touched else False)
             allowance_states.append(dict(record, status="matching" if valid else "changed", current=state["hash"]))
+    if testing:
+        # Reuse directory/review classifications without changing protection or
+        # treating arbitrary paths in an approval request as scope exemptions.
+        review_files = set(additions + support)
+        scope_test_dirs = set(test_dirs) | (set(protected) & set(support_dirs))
+        scope_files = [f for f in scope_files if rel(f) not in review_files
+                       and not (is_test_file(f) and any(under(f, d) for d in scope_test_dirs))]
     return {"base": (task.get("base") or "")[:10], "changed": changed_count,
             "out_of_scope": [rel(f) for f in scope_files if scope and not under(f, scope)][:20],
             "protected_touched": touched, "protected_violations": violations, "protected_added_tests": additions,
