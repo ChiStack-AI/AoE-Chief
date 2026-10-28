@@ -689,8 +689,8 @@ class TrustPreviewTests(InboxFixture):
     def test_successful_creation_resets_the_next_composer_to_OFF(self):
         lifecycle = self.watch_creation()
         self.ui(*self.compose(), "t", "\n", self.idle,
+                lambda: self.assert_created_trust(lifecycle, True, set()),
                 *self.compose("Another task"), lambda: self.assert_trust_preview(False), "\x1b")
-        self.assert_created_trust(lifecycle, True, set())
 
     def test_start_failure_cannot_resubmit_and_the_next_composer_is_OFF(self):
         self.patch_object(chief, "tick", return_value=[])
