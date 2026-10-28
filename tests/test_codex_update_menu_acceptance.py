@@ -26,6 +26,24 @@ REAL_SCREEN = """  Update available · 0.162.1 → 0.165.0
   3. Skip until next version
   enter continue · esc skip
 """
+# Real Codex 0.162.1 screen after the user pressed Esc. Only decorative
+# ASCII-art logo lines were omitted; the history banner and rest are verbatim.
+AFTER_SKIP_SCREEN = """╭─────────────────────────────────────────────────╮
+│ ✨ Update available! 0.162.1 -> 0.165.0         │
+│ Run npm install -g @openai/codex to update.     │
+│                                                 │
+│ See full release notes:                         │
+│ https://github.com/openai/codex/releases/latest │
+╰─────────────────────────────────────────────────╯
+  >_ OpenAI Codex (v0.162.1)
+     ~/.claude/jobs/e5acd660/tmp/codexprobe2-1793196696
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · ~/.claude/jobs/e5acd660/tmp/codexprobe2-1793196696 · Context 0% used · weekly 99% left
+  ← for agents · ? for shortcuts
+"""
+UPDATE_BANNER = AFTER_SKIP_SCREEN.split("  >_ OpenAI Codex", 1)[0]
 HEADING = REAL_SCREEN.splitlines()[0].strip()
 OPTION = REAL_SCREEN.splitlines()[2]
 READY = "› Ask Codex to do anything\n"
@@ -113,6 +131,22 @@ class CodexUpdateDetectionTests(unittest.TestCase):
             for trust in (False, True):
                 with self.subTest(timeout=timeout, trust=trust):
                     self.observe(REAL_SCREEN, trust=trust, timeout=timeout)
+
+    def test_real_post_skip_history_banner_is_ready_without_keys_in_both_timeout_modes(self):
+        for timeout in (0, -1, 12):
+            for trust in (False, True):
+                for status in ("idle", "waiting"):
+                    with self.subTest(timeout=timeout, trust=trust, status=status):
+                        self.observe(AFTER_SKIP_SCREEN, trust=trust, timeout=timeout,
+                                     status=status, expected="ready")
+
+    def test_real_history_banner_above_open_menu_still_returns_update_without_keys(self):
+        for timeout in (0, -1, 12):
+            for trust in (False, True):
+                for status in ("idle", "waiting"):
+                    with self.subTest(timeout=timeout, trust=trust, status=status):
+                        self.observe(UPDATE_BANNER + REAL_SCREEN, trust=trust,
+                                     timeout=timeout, status=status)
 
     def test_whitespace_and_both_terminal_border_styles_are_accepted(self):
         for frame in ("{}", " \t{}\t ", "  │ {} │  ", "  ┃ {} ┃  ", "│ {}", "{} ┃"):
@@ -300,6 +334,14 @@ class CodexUpdateMessageTests(ChiefFixture):
                 for trust in (False, True):
                     with self.subTest(path=path, lang=lang, trust=trust):
                         self.assert_update_message(self.report(path, lang, trust), path, lang)
+
+    def test_history_banner_above_open_menu_preserves_versions_in_all_three_message_paths(self):
+        for path in ("start", "rotate", "kickoff"):
+            for lang in ("en", "zh"):
+                for trust in (False, True):
+                    with self.subTest(path=path, lang=lang, trust=trust):
+                        text = self.report(path, lang, trust, screens=UPDATE_BANNER + REAL_SCREEN)
+                        self.assert_update_message(text, path, lang, versions=("0.162.1", "0.165.0"))
 
     def test_versions_are_extracted_from_observed_screen_including_bordered_forms(self):
         versions = ("1.23.4", "2.34.5")
