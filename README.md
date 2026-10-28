@@ -316,6 +316,13 @@ Chief validates the result, restores the terminal and returns to the preview bef
 or editor failures keep the last valid contract. `Esc` cancels input, a pending draft or a preview without creating a
 task, branch, worktree or session; late draft results are discarded. PgUp/PgDn scroll long contracts.
 
+In the contract preview, when idle, lowercase `t` toggles **Trust this folder** for this task only.
+The default is **OFF** for each task; cancelling or reopening the composer resets it to OFF. The preview line
+and footer show the current state. **ON** means Chief answers the agent's trust-this-folder prompt for you in
+this repository, matching `chief new --trust`. **OFF** means you confirm it in the session, then run
+`chief.py kickoff <id>`. Toggling creates nothing. Your selection survives contract editing, including invalid
+edits and editor failures; AI-generated or edited contract JSON never sets it.
+
 Drafting and startup run in the background, and repeated submissions are ignored. Failures appear in the inbox.
 After confirming startup, let it finish; if startup fails, use the reported task ID to inspect or resume it with
 `chief kickoff <task-id>` instead of submitting the same contract again.

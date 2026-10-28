@@ -357,6 +357,12 @@ def render(ch, st, w, h):
             detail = [("yellow", message)]
     elif new:
         detail = [("head", L("Repository: ", "仓库：") + (new.get("resolved_repo") or new["repo"]))]
+        if new["phase"] == "preview":
+            trust = (L("Trust this folder: ON — Chief answers the agent's trust-this-folder prompt for you in this repository.",
+                       "信任此文件夹：开启 — Chief 在此仓库中替你回答 Agent 的信任文件夹提示。") if new["trust"] else
+                     L("Trust this folder: OFF — You confirm it in the session, then run chief.py kickoff <id>.",
+                       "信任此文件夹：关闭 — 请在会话中确认，然后运行 chief.py kickoff <id>。"))
+            detail.append(("info", trust))
         if new.get("contract"):
             detail.append(("text", json.dumps(new["contract"], ensure_ascii=False, indent=2)))
         else:
@@ -437,7 +443,9 @@ def render(ch, st, w, h):
             if w < 60:
                 keys = "↑↓  Enter  Tab  Esc"
         elif new["phase"] == "preview":
-            keys = L("Enter create & start  e edit  Esc cancel", "Enter 创建并启动  e 编辑  Esc 取消")
+            keys = L("Enter create & start  e edit  t trust: {}  Esc cancel",
+                     "Enter 创建并启动  e 编辑  t 信任：{}  Esc 取消").format(
+                         L("on", "开启") if new["trust"] else L("off", "关闭"))
         elif new["phase"] == "drafting":
             keys = L("Esc cancel", "Esc 取消")
         else:
@@ -1231,8 +1239,9 @@ class Inbox:
         e = self.selected()
         repo = (e or {}).get("repo") or self.current_repo
         repos = sorted(set(self.repositories + [repo]))
+        # Trust is this composer's choice, independent of generated or edited contract JSON.
         new = {"phase": "intent", "repo": repo, "intent": "", "active": "intent", "repos": repos,
-               "index": repos.index(repo), "repo_cycle": False, "repo_version": 0}
+               "index": repos.index(repo), "repo_cycle": False, "repo_version": 0, "trust": False}
         self.st.update(new_task=new, scroll=0, msg="")
         self.repository_changed(new, known=True)
         self.composer_input(new)
@@ -1350,11 +1359,13 @@ class Inbox:
         # Consume confirmation before any background work. Neither an extra Enter
         # nor a launch failure can reuse this preview to create another task.
         new["phase"] = "starting"
+        trust = new["trust"]
 
         def start():
             task = None
             try:
-                task = self.ch.prepare_new_task(self.ch.validate_draft(new["contract"]))
+                contract = self.ch.validate_draft(new["contract"])
+                task = self.ch.prepare_new_task(contract, trust=trust)
                 task = self.ch.create_task(self.cfg, task)
                 return self.ch.L("Started task {}", "已启动任务 {}").format(task["id"]) + (
                     ": " + task["note"] if task.get("note") else "")
@@ -1460,6 +1471,8 @@ class Inbox:
                     self.submit_new(new)
                 elif k == "e":
                     return "edit"
+                elif k == "t":
+                    new["trust"] = not new["trust"]
             if k == "q" and new["phase"] != "starting":
                 self.cancel_new()
                 return False

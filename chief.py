@@ -3101,6 +3101,11 @@ def argument_parser(parser_class=argparse.ArgumentParser, selected=None):
                                          "查看或设置默认 AI 引擎，并列出各档位模型"))
     en.add_argument("name", nargs="?", choices=["codex", "claude"])
     inbox_help = L("Interactive inbox. '?' opens a one-line AI question box; Enter submits a nonempty question. "
+                   "N opens the task composer. In its contract preview, when idle, lowercase t toggles Trust this folder "
+                   "for this task only (default OFF for each task; reset on cancellation or reopening). "
+                   "ON means Chief answers the agent's trust-this-folder prompt for you in this repository, "
+                   "matching chief new --trust. OFF means you confirm it in the session, then run chief.py kickoff <id>. "
+                   "Toggling creates nothing. The choice survives contract edits and editor failures; contract JSON never sets it. "
                    "For protected-path requests, 'a approve paths' grants an exact addition allowance or current-state approval "
                    "without a draft. Further edits to approved states require renewed approval. 'r' sends feedback and 'd' "
                    "dismisses; neither grants permission and violations stay red. "
@@ -3121,6 +3126,10 @@ def argument_parser(parser_class=argparse.ArgumentParser, selected=None):
                    "completed side effects are not undone. Close, clean, stop and archive require y/N confirmation. "
                    "Output remains in its log entry. Use chief console for an interactive shell.",
                    "交互收件箱。'?' 打开一行 AI 提问框，Enter 提交非空问题。后台思考时仍可选择会话；"
+                   "N 打开任务编辑器。在合同预览空闲时，小写 t 切换本次任务的“信任此文件夹”，"
+                   "每个任务默认关闭，取消或重新打开后重置为关闭。开启表示 Chief 在此仓库中替你回答 Agent 的信任文件夹提示，"
+                   "等同 chief new --trust；关闭表示你在会话中确认，然后运行 chief.py kickoff <id>。"
+                   "切换不会创建任务；合同编辑、无效编辑或编辑器失败均保留选择，合同 JSON 不会设置此选项。"
                    "受保护路径审批无需草稿：a 批准精确的新增路径或当前状态，后续状态修改需要重新批准；"
                    "r 仅发送反馈，d 关闭决策，两者均不授权，违规保持红色。"
                    "Esc 取消输入或 AI 生成并终止所属进程树，丢弃过期结果。大写 L 打开命令与 AI 问答的统一日志，"
