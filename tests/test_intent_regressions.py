@@ -34,8 +34,7 @@ class ScopePhaseTests(flow.ChiefFixture):
                 scope = chief.scope_info(str(self.repo), self.task)
                 self.assertEqual(scope["protected_touched"], ["secrets.env"])
                 self.assertEqual(scope["changed"], 4)
-                self.assertCountEqual(scope["out_of_scope"],
-                                      ["tests/test_existing.py", "tests/test_new_acceptance.py", "secrets.env"])
+                self.assertEqual(scope["out_of_scope"], ["secrets.env"])
 
     def test_build_and_legacy_tasks_still_flag_protected_test_changes(self):
         for task in (dict(self.task, phase="build"),
