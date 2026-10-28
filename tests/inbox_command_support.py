@@ -279,8 +279,11 @@ class CommandFixture(composer.ComposerFixture):
             os.kill(pid, 0)
         except ProcessLookupError:
             return
-        stat = Path("/proc") / str(pid) / "stat"
-        if stat.exists() and stat.read_text().split(")", 1)[1].strip().startswith("Z"):
+        try:
+            # The process may finish exiting between kill() and this read; a vanished entry means it is gone.
+            if (Path("/proc") / str(pid) / "stat").read_text().split(")", 1)[1].strip().startswith("Z"):
+                return
+        except (FileNotFoundError, ProcessLookupError):
             return
         self.fail("cancelled command still has a live owned process: " + str(pid))
 
