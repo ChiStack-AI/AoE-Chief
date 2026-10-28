@@ -878,7 +878,11 @@ ACTIVE = ("running", "needs-you", "review")
 # Match whole question lines, allowing terminal borders but not quoted questions in prose.
 TRUST_RE = re.compile(
     r"^[ \t│┃]*(?:Trust this folder\?|Do you trust the files in this folder\??|"
-    r"(?P<claude>Is this a project you created or one you trust\?))[ \t│┃]*$", re.M)
+    r"(?P<claude>(?:Quick safety check:[ \t]*)?Is this a project you created or one you trust\?"
+    r"(?: \([^\r\n]*)?))[ \t│┃]*$", re.M)
+TRUST_OPTION_RE = re.compile(
+    r"^[ \t│┃]*(?P<selected>❯)?[ \t]*(?:(?P<number>[1-9][0-9]*)[.)][ \t]+)?"
+    r"(?:(?P<yes>Yes, I trust this folder)|No, exit)[ \t│┃]*$", re.M)
 # The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
 # shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
 INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
@@ -1211,6 +1215,34 @@ def at_prompt(status, sc):
     tail = (sc or "")[-800:]
     return status in ("idle", "waiting") and bool(INPUT_RE.search(tail)) and not ASK_PATTERNS.search(tail)
 
+def answer_trust_menu(cfg, sid, target, sc):
+    """Use a displayed numeric shortcut or confirm Yes from a fresh menu capture."""
+    options = list(TRUST_OPTION_RE.finditer(sc))
+    yes = [option for option in options if option.group("yes")]
+    selected = [option for option in options if option.group("selected")]
+    if len(yes) != 1 or len(selected) != 1:
+        return False
+    if all(option.group("number") for option in options):
+        call(["tmux", "send-keys", "-t", target, yes[0].group("number"), "Enter"], timeout=5)
+        return True
+    # Unnumbered menus can start on No. Never send Enter until a new capture shows Yes.
+    for attempt in range(4):
+        sc = screen(cfg, sid) or ""
+        options = list(TRUST_OPTION_RE.finditer(sc))
+        yes = [n for n, option in enumerate(options) if option.group("yes")]
+        selected = [n for n, option in enumerate(options) if option.group("selected")]
+        if not TRUST_RE.search(sc) or len(yes) != 1 or len(selected) != 1:
+            return False
+        if yes[0] == selected[0]:
+            call(["tmux", "send-keys", "-t", target, "Enter"], timeout=5)
+            return True
+        if attempt == 3:
+            return False
+        key = "Down" if yes[0] > selected[0] else "Up"
+        call(["tmux", "send-keys", "-t", target, key], timeout=5)
+        time.sleep(0.25)
+    return False
+
 def wait_ready(cfg, sid, trust, timeout=120):
     """Wait until the agent can take input. Trust prompts are answered at most once and only when trust is True.
     AoE may report idle before the TUI is drawn, so also require the input box on screen and no trust prompt."""
@@ -1230,9 +1262,13 @@ def wait_ready(cfg, sid, trust, timeout=120):
                 return "trust"
             target = tmux_target(sid)
             if target:
-                # Claude's new prompt needs its affirmative option selected explicitly.
-                keys = ["1", "Enter"] if trust_prompt.group("claude") else ["Enter"]
-                call(["tmux", "send-keys", "-t", target] + keys, timeout=5)
+                no_selected = any(option.group("selected") and not option.group("yes")
+                                  for option in TRUST_OPTION_RE.finditer(sc))
+                if trust_prompt.group("claude") or no_selected:
+                    if not answer_trust_menu(cfg, sid, target, sc):
+                        return "trust"
+                else:
+                    call(["tmux", "send-keys", "-t", target, "Enter"], timeout=5)
                 trust = False                   # answer it only once
         time.sleep(3)
     return "timeout"
