@@ -27,6 +27,25 @@ import threading
 import time
 import unicodedata
 
+
+def content_hash(path):
+    """Hash source bytes, ignoring metadata-only changes and transient read failures."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+SOURCE_PATH = Path(__file__).resolve()
+STARTUP_HASH = content_hash(SOURCE_PATH)
+STARTUP_ARGV = tuple(sys.argv)
+
+
+def source_changed():
+    current = content_hash(SOURCE_PATH)
+    return current is not None and STARTUP_HASH is not None and current != STARTUP_HASH
+
+
 ROOT = Path(os.environ.get("AOE_CHIEF_HOME", str(Path.home()/".local/state/aoe-chief"))).expanduser()
 CFG = ROOT / "config.json"
 LAST = ROOT / "latest.json"
@@ -1245,7 +1264,14 @@ def answer_trust_menu(cfg, sid, target, sc):
 
 def wait_ready(cfg, sid, trust, timeout=120):
     """Wait until the agent can take input. Trust prompts are answered at most once and only when trust is True.
-    AoE may report idle before the TUI is drawn, so also require the input box on screen and no trust prompt."""
+    AoE may report idle before the TUI is drawn, so also require the input box on screen and no trust prompt.
+    A zero timeout is a single observation: never wait, start a worker or answer a trust prompt."""
+    if timeout <= 0:
+        st = json.loads(aoe(cfg, "session", "show", "--json", sid)).get("status")
+        sc = screen(cfg, sid) or ""
+        if TRUST_RE.search(sc):
+            return "trust"
+        return "ready" if at_prompt(st, sc) else "timeout"
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -1578,6 +1604,8 @@ def note_preference(d, what):
 
 def send_decision(cfg, d, text, resolution):
     """Send only if the session is still at the turn that asked, and can take input."""
+    if is_protected_approval(d) and resolution == "accepted":
+        return accept_protected(cfg, d)
     rec = aoe_records(cfg).get(d["session"])
     if not rec:
         raise RuntimeError(L("session {} no longer exists", "会话 {} 已不存在").format(d["session"][:8]))
@@ -1595,14 +1623,7 @@ def send_decision(cfg, d, text, resolution):
     if is_protected_approval(d):
         if t.get("session_id") != d["session"]:
             raise RuntimeError(L("the task's worker changed; refresh the decision", "任务 Worker 已改变；请刷新决策"))
-        if resolution == "accepted":
-            t = approve_protected(cfg, t, d)
-            save_task(t)  # The permission is durable before sending anything to the worker.
-            text = user_reply("The protected-path changes in {} are approved.\n".format(", ".join(d["files"])) +
-                              "\n".join(allowed_change_lines(t, english=True)) +
-                              "\nAll other protected changes still require explicit approval.")
-        else:
-            text += "\nThis is feedback only; no permission to change protected paths was granted."
+        text += "\nThis is feedback only; no permission to change protected paths was granted."
     if in_test_phase(t):
         if resolution == "accepted" and is_test_approval(t, d.get("question")):
             files = approval_files(d["question"])
@@ -1651,11 +1672,14 @@ def accept_decision(cfg, d):
 
 def approve_protected(cfg, task, decision):
     """Approve only the displayed paths and their rechecked current state."""
+    if task.get("id") != decision.get("task") or task.get("session_id") != decision.get("session"):
+        raise RuntimeError(L("the task's worker changed; refresh the decision", "任务 Worker 已改变；请刷新决策"))
     if in_test_phase(task):
         raise RuntimeError(L("protected changes cannot be approved during the test phase",
                              "测试阶段不能批准受保护路径改动"))
     stored = find_decision(decision["id"])
-    if stored["state"] != "pending" or stored.get("files") != decision.get("files"):
+    if stored["state"] != "pending" or any(stored.get(k) != decision.get(k)
+                                          for k in ("task", "session", "kind", "files", "snapshot", "created_at")):
         raise RuntimeError(L("the approval set changed; refresh and review it", "审批文件集已改变；请刷新并审查"))
     scope = scope_info(task.get("worktree") or task["repo"], task, cfg.get("scope_ignore", []))
     if scope is None:
@@ -1684,6 +1708,125 @@ def approve_protected(cfg, task, decision):
                 record["rename_peers"] = sorted(peers)
         allowed[path] = record
     return dict(task, allowed=list(allowed.values()))
+
+
+def protected_notice_path(decision):
+    # IDs can be reused if decision history is replaced. Bind the outbox entry
+    # to the original pending decision's generation, not only its display ID.
+    key = hashlib.sha256((decision["id"] + "\0" + decision.get("created_at", "")).encode("utf-8")).hexdigest()
+    return TASKS/decision["task"]/"protected-notices"/(key + ".json")
+
+
+def protected_notice_status(decision):
+    path = protected_notice_path(decision)
+    notice = load_json(path, {})
+    state = notice.get("state")
+    # An exclusive claim survives interruption even before the attempted JSON
+    # update. Never treat such a notice as queued/retryable again.
+    if state == "queued" and path.with_suffix(".attempted").exists():
+        return "unconfirmed"
+    return state or ("delivered" if decision.get("delivered") else "unconfirmed")
+
+
+def protected_approval_message(decision):
+    status = protected_notice_status(decision)
+    if status == "delivered":
+        return L("Approved protected paths; worker notice delivered", "已批准受保护路径；已送达 Worker 通知")
+    if status == "queued":
+        return L("Approved protected paths; worker notice queued for a later tick",
+                 "已批准受保护路径；Worker 通知已排队，等待后续 tick 发送")
+    return L("Approved protected paths; worker notice delivery unconfirmed; check the session (no automatic resend)",
+             "已批准受保护路径；Worker 通知未确认送达，请检查会话（不会自动重发）")
+
+
+def accept_protected(cfg, decision):
+    """Validate and persist consent first; notification is a separate durable operation."""
+    task = approve_protected(cfg, load_task(decision["task"]), decision)
+    text = user_reply("The protected-path changes in {} are approved.\n".format(", ".join(decision["files"])) +
+                      "\n".join(allowed_change_lines(task, english=True)) +
+                      "\nAll other protected changes still require explicit approval.")
+    reset_auto(task)
+    task["state"] = "needs-you"
+    save_task(task)
+    resolved_at = now_utc().isoformat()
+    notice = dict(decision=decision["id"], decision_created_at=decision.get("created_at", ""),
+                  task=task["id"], session=decision["session"],
+                  text=text, state="queued", created_at=resolved_at)
+    # The outbox is independent of decision reconciliation and task state writes.
+    # Only accepted decisions are eligible for delivery.
+    safe_write(protected_notice_path(decision), json.dumps(notice, ensure_ascii=False, indent=2) + "\n")
+    decision.update(state="sent", resolution="accepted", sent=text, resolved_at=resolved_at, delivered=False)
+    update_decision(decision)
+    return deliver_protected_notice(cfg, notice)
+
+
+def deliver_protected_notice(cfg, notice):
+    """Try one ready worker once. A failed readiness probe leaves the notice queued."""
+    identity = {"id": notice["decision"], "task": notice["task"], "created_at": notice["decision_created_at"]}
+    path = protected_notice_path(identity)
+    notice = load_json(path, {})
+    if notice.get("state") != "queued" or path.with_suffix(".attempted").exists():
+        return notice.get("state") == "delivered"
+    task = load_task(identity["task"])
+    decision = find_decision(identity["id"])
+    if (task.get("state") not in ACTIVE or task.get("session_id") != notice["session"] or
+            decision.get("resolution") != "accepted" or decision.get("session") != notice["session"] or
+            decision.get("created_at", "") != notice["decision_created_at"]):
+        return False
+    try:
+        rec = aoe_records(cfg).get(notice["session"])
+        if (not rec or rec.get("archived") or rec.get("trashed_at") or
+                rec.get("state") in ("archived", "trashed", "deleted") or
+                rec.get("status") in ("running", "stopped", "missing", "deleted") or
+                wait_ready(cfg, notice["session"], False, timeout=0) != "ready"):
+            return False
+    except (RuntimeError, OSError, ValueError):
+        return False
+
+    # Atomic across processes, including CLI acceptance racing a tick. Keep the
+    # claim forever: a crash or uncertainty after this boundary cannot be retried.
+    try:
+        with open(str(path.with_suffix(".attempted")), "x"):
+            pass
+    except FileExistsError:
+        return False
+    notice.update(state="attempted", attempted_at=now_utc().isoformat())
+    safe_write(path, json.dumps(notice, ensure_ascii=False, indent=2) + "\n")
+    try:
+        ok = deliver(cfg, notice["session"], notice["text"], notice["text"].split("\n")[0][:50])
+    except (RuntimeError, OSError, ValueError) as exc:
+        ok = False
+        notice["error"] = clip(str(exc), 300)
+    notice.update(state="delivered" if ok else "unconfirmed", finished_at=now_utc().isoformat())
+    safe_write(path, json.dumps(notice, ensure_ascii=False, indent=2) + "\n")
+    # Reload so delivery cannot restore a stale decision or task contract.
+    decision = find_decision(identity["id"])
+    decision["delivered"] = bool(ok)
+    update_decision(decision)
+    task = load_task(identity["task"])
+    if task.get("session_id") == notice["session"] and task.get("state") in ACTIVE:
+        reset_auto(task)
+        task["state"] = "running" if ok else "needs-you"
+        if not ok:
+            task["note"] = protected_approval_message(decision)
+        save_task(task)
+    return bool(ok)
+
+
+def drain_protected_notices(cfg):
+    done = []
+    for task in all_tasks():
+        for path in sorted((TASKS/task["id"]/"protected-notices").glob("*.json")):
+            notice = load_json(path, {})
+            if notice.get("state") != "queued" or path.with_suffix(".attempted").exists():
+                continue
+            deliver_protected_notice(cfg, notice)
+            identity = {"id": notice["decision"], "task": task["id"], "created_at": notice["decision_created_at"]}
+            status = protected_notice_status(identity)
+            if status != "queued":
+                done.append("{} · {}".format(task["id"], protected_approval_message(identity)))
+    return done
+
 
 def reply_decision(cfg, d, text):
     if d.get("draft"):
@@ -2191,26 +2334,26 @@ def reply_session(cfg, sid, text):
 
 def tick(cfg, dry=False):
     """One pass (with tick's own state file), then the automatic action for each board task."""
-    lock = open(str(ROOT/"tick.lock"), "w")
-    try:
-        import fcntl
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (ImportError, OSError):
-        return [L("another tick is running; skipped", "另一个 tick 正在运行，跳过")]
-    result = collect(cfg, state_file=TICK)
-    done = []
-    for it in result["items"]:
-        t = it["task"]
-        if not t.get("id"):
-            continue
+    with open(str(ROOT/"tick.lock"), "w") as lock:
         try:
-            what = act(cfg, it, load_task(t["id"]), dry)
-        except RuntimeError as e:
-            what = L("error: ", "出错：") + clip(str(e), 200)
-            log_event(t, "error", what)
-        if what:
-            done.append("{} · {}".format(t["id"], what))
-    return done
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (ImportError, OSError):
+            return [L("another tick is running; skipped", "另一个 tick 正在运行，跳过")]
+        done = [] if dry else drain_protected_notices(cfg)
+        result = collect(cfg, state_file=TICK)
+        for it in result["items"]:
+            t = it["task"]
+            if not t.get("id"):
+                continue
+            try:
+                what = act(cfg, it, load_task(t["id"]), dry)
+            except RuntimeError as e:
+                what = L("error: ", "出错：") + clip(str(e), 200)
+                log_event(t, "error", what)
+            if what:
+                done.append("{} · {}".format(t["id"], what))
+        return done
 
 # ---------- Collect and judge ----------
 
@@ -2239,6 +2382,18 @@ def collect(cfg, checks=True, persist=True, state_file=LAST):
         if not row or row.get("state") != "live":
             it.update(status="missing" if not row else row.get("state"),
                       signals=[("red", L("the session is gone or archived", "Session 不存在或已归档"), "missing")])
+            # Protected consent depends on the task's files, not a live worker.
+            # Keep its card current without changing ordinary turn-bound decisions.
+            if task.get("id") and task.get("state") in ACTIVE:
+                it["path"] = task.get("worktree") or task.get("repo") or ""
+                it["scope"] = scope_info(it["path"], task, cfg.get("scope_ignore", []))
+                ds = load_decisions(task["id"])
+                if sync_protected_decisions(task, it, ds, now_utc().isoformat()):
+                    save_decisions(task["id"], ds)
+                dec = next((d for d in ds if d["state"] == "pending" and is_protected_approval(d)), None)
+                if dec:
+                    it["decision"] = {k: dec.get(k) for k in ("id", "size", "question", "choice", "draft", "why", "by", "kind", "files", "snapshot")}
+                    it["signals"] = decision_signals(it["signals"], dec, {})
             items.append(it)
             continue
         it["status"] = rec.get("status") or "unknown"
@@ -3387,10 +3542,12 @@ def main(argv=None):
                 update_decision(d)
             if args.accept:
                 ok = accept_decision(cfg, d)
-                print((L("Approved the acceptance tests", "已批准验收测试") if d.get("kind") == "test-approval" else
-                       L("Approved protected paths", "已批准受保护路径") if is_protected_approval(d) else
-                       L("Sent chief's draft", "已发送 chief 的草稿")) + ("" if ok else L(", but delivery was not confirmed; check the session",
-                                                                                     "，但没确认送达，进入会话看看")))
+                if is_protected_approval(d):
+                    print(protected_approval_message(d))
+                else:
+                    print((L("Approved the acceptance tests", "已批准验收测试") if d.get("kind") == "test-approval" else
+                           L("Sent chief's draft", "已发送 chief 的草稿")) + ("" if ok else L(", but delivery was not confirmed; check the session",
+                                                                                         "，但没确认送达，进入会话看看")))
             elif args.reply:
                 consent_feedback = (is_test_approval(load_task(d["task"]), d.get("question")) and
                                     looks_like_test_consent(args.reply))
@@ -3412,6 +3569,10 @@ def main(argv=None):
             print(L("Ticking every {} seconds; Ctrl-C to stop", "每 {} 秒 tick 一次，Ctrl-C 退出").format(args.every), file=sys.stderr)
             try:
                 while True:
+                    if source_changed():
+                        print(L("Chief was updated; re-executing before the next tick",
+                                "Chief 已更新；将在下一次 tick 前重新执行"), file=sys.stderr, flush=True)
+                        os.execv(sys.executable, [sys.executable] + list(STARTUP_ARGV))
                     try:
                         lines = tick(cfg)
                     except (RuntimeError, ValueError, OSError) as e:      # one failed tick must not end the watch

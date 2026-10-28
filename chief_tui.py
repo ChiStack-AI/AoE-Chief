@@ -10,6 +10,7 @@ import codecs
 import copy
 from datetime import datetime
 from functools import lru_cache
+import hashlib
 import json
 import locale
 import os
@@ -23,6 +24,23 @@ import tempfile
 import threading
 import time
 import unicodedata
+
+
+def content_hash(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+SOURCE_PATH = Path(__file__).resolve()
+STARTUP_HASH = content_hash(SOURCE_PATH)
+
+
+def source_changed():
+    current = content_hash(SOURCE_PATH)
+    return current is not None and STARTUP_HASH is not None and current != STARTUP_HASH
+
 
 MARK = {"red": "[!]", "draft": "[?]", "green": "[+]", "yellow": "[~]", "grey": "[ ]"}
 ORDER = ("red", "draft", "green", "yellow", "grey")
@@ -291,10 +309,13 @@ def render(ch, st, w, h):
             len(es), n["red"], n["draft"], n["green"])
         right = st.get("clock", "") + " "
     rows.append([(fit(left, max(0, w - width(right))), "header"), (fit(right, min(w, width(right))), "header")])
-    if not es and not new and h >= bottom_h + 3:
+    if st.get("source_notice"):
+        for line in wrap(st["source_notice"], max(1, w - 1))[:max(0, h - bottom_h - 2)]:
+            rows.append([(fit(" " + line, w), "header")])
+    if not es and not new and len(rows) < h - bottom_h - 1:
         rows.append([(fit(" " + (st.get("empty") or L("Loading…", "加载中…")), w), "info")])
     list_h = min(max(0, h - 4), max(3, (h - 4) // 3)) if es else 0
-    list_h = min(list_h, max(0, h - bottom_h - 2))
+    list_h = min(list_h, max(0, h - bottom_h - len(rows) - 1))
     sel = max(0, min(st.get("sel", 0), len(es) - 1))
     top, used = sel, 2                  # reserve a heading and the selected item
     while top > 0:
@@ -740,6 +761,7 @@ class Inbox:
         self.command_editor = None
         self.ai_execution = None
         self.board_result = {}
+        self.inbox_session_id = os.environ.get("AOE_SESSION_ID")
 
     def log_operation(self, kind, text):
         turn = {"kind": kind, "question" if kind == "ai" else "command": terminal_text(text)}
@@ -1089,7 +1111,26 @@ class Inbox:
             return False
         return True
 
+    def update_source_notice(self, records=None):
+        updated = source_changed() or getattr(self.ch, "source_changed", lambda: False)()
+        if not updated:
+            self.st["source_notice"] = ""
+            return
+        if not self.inbox_session_id and records and os.environ.get("TMUX"):
+            try:
+                name = self.ch.call(["tmux", "display-message", "-p", "#{session_name}"], timeout=3).strip()
+                hits = [sid for sid in records if name.endswith("_" + sid[:8])]
+                if len(hits) == 1:
+                    self.inbox_session_id = hits[0]
+            except (RuntimeError, OSError):
+                pass
+        self.st["source_notice"] = ("Chief was updated; restart this inbox: aoe session stop/start " +
+                                    (self.inbox_session_id or "<id>"))
+
     def _refresh(self):
+        # Compare against loaded hashes before board I/O, so even a failed
+        # refresh leaves a visible warning. Never restart this interactive UI.
+        self.update_source_notice()
         res = self.ch.collect(self.cfg, checks=False, persist=False)
         self.board_result = res
         es = entries(self.ch, res)
@@ -1129,6 +1170,7 @@ class Inbox:
         # All filesystem/AoE completion loading happens in the refresh job, never
         # in a key handler. Persisted records include archives and trash.
         records = getattr(self.ch, "aoe_records", lambda cfg: {})(self.cfg)
+        self.update_source_notice(records)
         sessions = {sid: ("trashed" if rec.get("trashed_at") or rec.get("state") in ("trashed", "deleted")
                           else "archived" if rec.get("archived") or rec.get("state") == "archived" else "live")
                     for sid, rec in records.items()}
@@ -1210,12 +1252,18 @@ class Inbox:
         ch, L = self.ch, self.ch.L
         approval = e.get("test_approval")
         protected = e.get("protected_approval")
+
+        def accept():
+            decision = self.decision(e, approval=True)
+            ok = ch.accept_decision(self.cfg, decision)
+            if protected:
+                return ch.protected_approval_message(decision)
+            return self.sent(ok, L("approved the acceptance tests", "已批准验收测试") if approval else
+                             L("sent chief's draft", "已发送 chief 的草稿"))
+
         self.job(L("approving the acceptance tests", "批准验收测试") if approval else
                  L("approving protected paths", "批准受保护路径") if protected else L("sending the draft", "发送草稿"),
-                 lambda: self.sent(ch.accept_decision(self.cfg, self.decision(e, approval=True)),
-                                   L("approved the acceptance tests", "已批准验收测试") if approval else
-                                   L("approved protected paths", "已批准受保护路径") if protected else
-                                   L("sent chief's draft", "已发送 chief 的草稿")))
+                 accept)
 
     def reply_entry(self, e, text):
         ch, L = self.ch, self.ch.L

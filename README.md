@@ -205,6 +205,16 @@ draft. Approval persists in the task contract's `allowed` list. An **addition** 
 editing of that exact normalized path, provided it did not exist at the task's scope base. It cannot cover
 directory descendants, siblings, baseline-existing files, or explicitly protected acceptance tests/support.
 
+After validating the displayed changes, Chief saves permission and resolves the decision before checking the
+worker. A busy, stopped, missing or unavailable worker cannot block approval. The CLI and Inbox distinguish
+permission granted with the worker notice delivered, notice queued, or delivery unconfirmed. Queued notices
+persist across Chief restarts and are sent on a later `tick` / `watch` pass when that same worker can take input,
+including in observe mode. The Inbox keeps protected approvals visible and refreshes their file snapshots
+even when the worker is missing. A delivery attempt is recorded before sending: unconfirmed or interrupted delivery
+has no automatic retry or resend. Check the worker's session before sending any manual follow-up;
+permission remains granted regardless of delivery. Ordinary decisions and acceptance-test approvals still
+require a ready worker and the original decision turn.
+
 Existing protected modifications, deletions and renames instead queue `Allow changes to protected <paths>?`.
 Accepting records each exact path's content hash, file mode, or explicit **deletion marker** (`deleted`). A
 **state** approval clears its violation only while that version still matches.
@@ -445,13 +455,22 @@ aoe add ~/aoe-chief -t "chief watch" --tool chief-watch --launch
 
 Then tasks keep moving without a terminal of yours open, and the AoE sidebar shows whether `watch` is alive.
 
-**Updating Chief:** pull, then restart both standing sessions with stop and start, not `aoe session restart`
-(restart types a wake message into the session, and the inbox would read its letters as keys):
+**Updating Chief:** pull your updates. A running `watch` compares chief.py's content hash against its loaded
+startup hash before each tick. When it changes, watch logs one line and re-executes with the same Python
+interpreter and original arguments. An ongoing pass finishes before the next iteration can reload; changes
+to timestamps or other metadata alone do not trigger a reload.
+
+The Inbox compares both `chief.py` and `chief_tui.py` with their loaded startup hashes on refresh. It shows
+`Chief was updated; restart this inbox: aoe session stop/start <id>` in the header, substituting the Inbox's
+session ID when available. Restart the Inbox manually with separate stop and start commands; it never
+restarts itself. Do not use `aoe session restart` (it types a wake message that the Inbox would read as keys):
 
 ```bash
 git -C ~/aoe-chief pull
-aoe session stop <ID> && aoe session start <ID>   # once for the inbox, once for watch
+aoe session stop <ID> && aoe session start <ID>   # Inbox session; watch reloads before its next tick
 ```
+
+When upgrading standing sessions that predate source-update detection, stop/start both sessions once.
 
 **Changing `custom_agents`:** AoE stores a session's command when the session is created, so editing
 `config.toml` does not change existing sessions. Remove the old session (`aoe remove <ID>`) and run the matching
