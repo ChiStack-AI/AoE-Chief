@@ -337,6 +337,14 @@ Drafting and startup run in the background, and repeated submissions are ignored
 After confirming startup, let it finish; if startup fails, use the reported task ID to inspect or resume it with
 `chief kickoff <task-id>` instead of submitting the same contract again.
 
+**Codex startup update menu:** `Update available · <old> → <new>` followed by `Update now` needs your action.
+Chief never updates or skips this menu, even with `--trust`; it sends no keys or kickoff/resume text.
+`Update now` runs bare `npm install -g @openai/codex`, which may use the wrong global prefix.
+Upgrade Codex yourself using your intended installation method and prefix, or press `Esc` in the session to skip
+the menu. Then run `chief.py kickoff <id>` (or `chief.py nudge <id>` after session rotation).
+The boxed `✨ Update available! <old> -> <new>` history banner left after Esc is informational; with the normal
+input box, Codex is ready. A still-open update menu below that banner continues to block Chief.
+
 The list separates **Delegated tasks** from tracked **Thinking sessions**, with urgent items first within each
 group. Arrow keys or j/k move between items and skip headings; refreshes retain the selected session.
 

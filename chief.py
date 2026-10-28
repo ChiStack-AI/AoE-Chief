@@ -905,6 +905,15 @@ TRUST_RE = re.compile(
 TRUST_OPTION_RE = re.compile(
     r"^[ \t│┃]*(?P<selected>[❯›])?[ \t]*(?:(?P<number>[1-9][0-9]*)[.)][ \t]+)?"
     r"(?:(?P<yes>Yes, I trust this folder|Trust and continue)|No, exit|Quit)[ \t│┃]*$", re.M)
+# Require a whole version heading and an Update now option within the next four lines.
+# The boxed "✨ Update available! ... -> ..." history banner left after Esc is not a menu.
+UPDATE_RE = re.compile(
+    r"^[ \t│┃]*Update available[ \t]+·[ \t]+"
+    r"(?P<old>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.+-]+)?)[ \t]+→[ \t]+"
+    r"(?P<new>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.+-]+)?)[ \t│┃]*\r?$"
+    r"(?=\n(?:[^\r\n]*\r?\n){0,3}?"
+    r"^[ \t│┃]*[›❯]?[ \t]*(?:1[.)][ \t]+)?Update now"
+    r"(?:[ \t]+\(runs[ \t]+`[^`\r\n]+`\))?[ \t│┃]*\r?$)", re.M)
 # The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
 # shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
 INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
@@ -1268,10 +1277,13 @@ def answer_trust_menu(cfg, sid, target, sc, numbers=True):
 def wait_ready(cfg, sid, trust, timeout=120):
     """Wait until the agent can take input. Trust prompts are answered at most once and only when trust is True.
     AoE may report idle before the TUI is drawn, so also require the input box on screen and no trust prompt.
+    Return update without any interaction when Codex offers its startup update menu.
     A zero timeout is a single observation: never wait, start a worker or answer a trust prompt."""
     if timeout <= 0:
         st = json.loads(aoe(cfg, "session", "show", "--json", sid)).get("status")
         sc = screen(cfg, sid) or ""
+        if UPDATE_RE.search(sc):
+            return "update"
         if TRUST_RE.search(sc):
             return "trust"
         return "ready" if at_prompt(st, sc) else "timeout"
@@ -1282,6 +1294,8 @@ def wait_ready(cfg, sid, trust, timeout=120):
         except (RuntimeError, ValueError):
             st = None
         sc = screen(cfg, sid) or ""
+        if UPDATE_RE.search(sc):
+            return "update"
         trust_prompt = TRUST_RE.search(sc)
         if at_prompt(st, sc) and not trust_prompt:
             time.sleep(2)                       # a freshly drawn input box may not own the keyboard yet
@@ -1302,6 +1316,19 @@ def wait_ready(cfg, sid, trust, timeout=120):
                 trust = False                   # answer it only once
         time.sleep(3)
     return "timeout"
+
+def codex_update_note(cfg, t, action="kickoff"):
+    """Re-observe for versions; the menu may have disappeared since wait_ready returned update."""
+    menu = UPDATE_RE.search(screen(cfg, t["session_id"]) or "")
+    if menu:
+        message = L("Codex is offering an update from {} to {}. ",
+                    "Codex 正在提供从 {} 到 {} 的更新。").format(menu.group("old"), menu.group("new"))
+    else:
+        message = L("Codex is offering an update. ", "Codex 正在提供更新。")
+    return message + L(
+        "Chief never updates or skips it. Upgrade Codex yourself or skip the menu in the session with Esc, "
+        "then run chief.py {} {}",
+        "Chief 从不更新或跳过此菜单。请自行升级 Codex，或在会话中按 Esc 跳过菜单，然后运行 chief.py {} {}").format(action, t["id"])
 
 def add_command(cfg, t, dry_run=False):
     """Prepare the local task branch so AoE reuses it instead of choosing a remote base."""
@@ -1330,10 +1357,13 @@ def start_task(cfg, t, trust=False):
     ready = wait_ready(cfg, sid, trust)
     if ready != "ready":
         t["state"] = "needs-you"
-        t["note"] = {"trust": L("the agent asks whether to trust this folder: confirm in the session, then run chief.py kickoff ",
-                                "Agent 在问是否信任这个目录：进入会话确认后运行 chief.py kickoff ") + t["id"],
-                     "timeout": L("the agent was not ready within 120s: check the session, then run chief.py kickoff ",
-                                  "Agent 120 秒内没有就绪：进入会话查看后运行 chief.py kickoff ") + t["id"]}[ready]
+        if ready == "update":
+            t["note"] = codex_update_note(cfg, t)
+        else:
+            t["note"] = {"trust": L("the agent asks whether to trust this folder: confirm in the session, then run chief.py kickoff ",
+                                    "Agent 在问是否信任这个目录：进入会话确认后运行 chief.py kickoff ") + t["id"],
+                         "timeout": L("the agent was not ready within 120s: check the session, then run chief.py kickoff ",
+                                      "Agent 120 秒内没有就绪：进入会话查看后运行 chief.py kickoff ") + t["id"]}[ready]
         save_task(t)
         return t
     send_kickoff(cfg, t)
@@ -2211,7 +2241,9 @@ def rotate_task(cfg, t, it, reason):
     except RuntimeError:
         pass
     ready = wait_ready(cfg, t["session_id"], t.get("trust", False))
-    if ready != "ready":
+    if ready == "update":
+        t["state"], t["note"] = "needs-you", codex_update_note(cfg, t, "nudge")
+    elif ready != "ready":
         t["state"], t["note"] = "needs-you", L("the new session is not ready ({}): handle it in the session, then run chief.py nudge {}",
                                                "新会话没有就绪（{}）：进入会话处理后运行 chief.py nudge {}").format(ready, t["id"])
     elif deliver(cfg, t["session_id"], kickoff_prompt(t, resume=True), "delegated task managed by AoE Chief"):
@@ -3432,7 +3464,10 @@ def main(argv=None):
             if t["state"] == "draft" or not t.get("session_id"):
                 t = start_task(cfg, t, args.trust)
             else:
-                if wait_ready(cfg, t["session_id"], args.trust, timeout=30) != "ready":
+                ready = wait_ready(cfg, t["session_id"], args.trust, timeout=30)
+                if ready == "update":
+                    raise RuntimeError(codex_update_note(cfg, t))
+                if ready != "ready":
                     raise RuntimeError(L("the session is not ready (perhaps waiting for you to trust the folder); handle it in the session and retry",
                                          "会话还没就绪（可能在等你确认信任目录），进入会话处理后再试"))
                 send_kickoff(cfg, t)
