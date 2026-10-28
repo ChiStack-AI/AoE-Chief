@@ -169,6 +169,18 @@ class ComposerFixture(delegation.InboxFixture):
 
 
 class ComposerNavigationTests(ComposerFixture):
+    def test_t_stays_literal_text_in_both_composer_lines_and_never_ticks(self):
+        target = self.make_repo("trust target")
+        tick = self.patch_object(chief, "tick", return_value=[])
+        before = self.artifacts()
+        self.scenario("N", "tT trust this task", (tui.curses.KEY_DOWN,), "\x15", str(target),
+                      Check(lambda: self.assert_fields("tT trust this task", target)),
+                      Check(lambda: self.assert_valid(target)), "\n",
+                      Check(lambda: self.drafted(target, "tT trust this task")),
+                      Check(lambda: self.assertIn("t trust: off", self.frame()[-1])), "\x1b")
+        tick.assert_not_called()
+        self.assertEqual(self.artifacts(), before)
+
     def test_intent_is_first_repository_second_and_focus_is_visible(self):
         focused = []
 
@@ -569,6 +581,13 @@ class ComposerDocumentationTests(unittest.TestCase):
         for phrase in ("absolute", "relative", "~/", "spaces", "common prefix", "paste"):
             self.assertIn(phrase, docs)
         self.assertRegex(docs, r"empty.*(?:tab|cycl)|(?:tab|cycl).*empty")
+
+    def test_readme_documents_preview_trust_default_scope_and_manual_confirmation(self):
+        docs = self.inbox_docs()
+        for pattern in (r"`t`", r"preview", r"trust this folder", r"default.*off|off.*default",
+                        r"per.task|each task|this task only", r"chief.*answer.*(?:agent|trust)",
+                        r"confirm.*session", r"chief\.py kickoff <(?:id|task-id)>"):
+            self.assertRegex(docs, pattern)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ repositories and isolated Chief state. AI and external sessions are mocked.
 No new Inbox methods or state keys are prescribed by this contract.
 """
 import copy
+import inspect
+import io
 import json
 import os
 from pathlib import Path
@@ -564,6 +566,312 @@ class ContractEditorTests(InboxFixture):
                 self.assertEqual(self.artifacts(), before)
 
 
+class TrustPreviewTests(InboxFixture):
+    """Trust is a fresh UI choice, independent of contract JSON and other tasks."""
+
+    def watch_creation(self):
+        self.prepare_signature = inspect.signature(chief.prepare_new_task)
+        lifecycle = mock.Mock()
+        for name in ("validate_draft", "prepare_new_task", "create_task"):
+            lifecycle.attach_mock(self.patch_object(chief, name, wraps=getattr(chief, name)), name)
+        return lifecycle
+
+    def assert_trust_preview(self, enabled, rows=None):
+        rows = rows if rows is not None else self.frame()
+        if chief.LANG == "en":
+            self.assertIn("t trust: " + ("on" if enabled else "off"), rows[-1])
+            lines = [line for line in rows[1:-2] if re.search(r"trust this folder", line, re.I)]
+            self.assertEqual(len(lines), 1, "show trust and its explanation on their own preview line")
+            self.assertRegex(lines[0], r"\bON\b" if enabled else r"\bOFF\b")
+            text = lines[0].lower()
+            if enabled:
+                for pattern in (r"chief.*answer", r"agent", r"prompt", r"\brepository\b|\brepo\b"):
+                    self.assertRegex(text, pattern)
+            else:
+                self.assertRegex(text, r"confirm.*session.*chief\.py kickoff <(?:id|task-id)>")
+        else:
+            state = r"(?:开启|打开|开|ON)" if enabled else r"(?:关闭|关|OFF)"
+            self.assertRegex(rows[-1], r"\bt\s+信任\s*[:：]\s*" + state)
+            lines = [line for line in rows[1:-2] if re.search(r"信任(?:此|这个)?(?:文件夹|目录)", line)]
+            self.assertEqual(len(lines), 1, "the Chinese preview needs its own localized trust line")
+            self.assertRegex(lines[0], r"[:：]\s*" + state)
+            if enabled:
+                for pattern in (r"Chief", r"回答|应答|确认", r"[Aa]gent|代理|智能体", r"提示|询问", r"仓库|代码库"):
+                    self.assertRegex(lines[0], pattern)
+            else:
+                self.assertRegex(lines[0], r"会话.*确认.*chief\.py kickoff <(?:id|task-id)>")
+        self.assertNotIn(self.contract["goal"], lines[0], "keep trust separate from the contract body")
+
+    def assert_created_trust(self, lifecycle, expected, previous_ids):
+        lifecycle.prepare_new_task.assert_called_once()
+        call = lifecycle.prepare_new_task.call_args
+        bound = self.prepare_signature.bind(*call[0], **call[1])
+        self.assertIn("trust", bound.arguments, "pass trust explicitly even when OFF; do not rely on a default")
+        self.assertIs(bound.arguments["trust"], expected, "pass the displayed boolean, not a truthy substitute")
+        lifecycle.create_task.assert_called_once()
+        prepared = lifecycle.create_task.call_args[0][1]
+        lifecycle.create_task.assert_called_once_with(self.cfg, prepared)
+        self.assertIs(prepared["trust"], expected)
+        self.start.assert_called_once_with(self.cfg, prepared, expected)
+        tasks = [task for task in chief.all_tasks() if task["id"] not in previous_ids]
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(len(chief.all_tasks()), len(previous_ids) + 1)
+        self.assertIs(tasks[0]["trust"], expected, "persist the selected boolean in task.json")
+        self.assertEqual([call[0] for call in lifecycle.mock_calls][-3:],
+                         ["validate_draft", "prepare_new_task", "create_task"])
+        return tasks[0]
+
+    def test_localized_OFF_ON_OFF_line_and_footer_toggle_without_any_artifacts(self):
+        lifecycle = self.watch_creation()
+        tick = self.patch_object(chief, "tick", return_value=[])
+        before = self.artifacts()
+        for lang in ("en", "zh"):
+            with self.subTest(lang=lang):
+                self.app = tui.Inbox(self.cfg, chief, 3600)
+                chief.LANG = lang
+                self.ui(*self.compose(), lambda: self.assert_trust_preview(False),
+                        "T", lambda: self.assert_trust_preview(False),
+                        "t", lambda: self.assert_trust_preview(True), self.preview,
+                        "T", lambda: self.assert_trust_preview(True),
+                        "t", lambda: self.assert_trust_preview(False), "\x1b")
+                self.no_submission()
+                lifecycle.prepare_new_task.assert_not_called()
+                lifecycle.create_task.assert_not_called()
+                tick.assert_not_called()
+                self.assertEqual(self.artifacts(), before)
+
+    def test_every_Enter_creates_once_with_explicit_displayed_OFF_ON_or_ON_to_OFF(self):
+        lifecycle = self.watch_creation()
+        for toggles, expected in (([], False), (["t"], True), (["t", "t"], False)):
+            for enter in ("\n", "\r", "KEY_ENTER"):
+                with self.subTest(toggles=toggles, enter=enter):
+                    lifecycle.reset_mock()
+                    self.start.reset_mock()
+                    previous_ids = {task["id"] for task in chief.all_tasks()}
+                    # The AI's trust field must never override the UI choice.
+                    self.contract["trust"] = not expected
+                    frames = []
+                    self.ui(*self.compose(), *toggles, lambda: frames.append(self.frame()), enter,
+                            "\n", "\r", "KEY_ENTER", self.idle, "\n", self.idle)
+                    self.assert_created_trust(lifecycle, expected, previous_ids)
+                    self.assert_trust_preview(expected, frames[0])
+
+    def test_generated_trust_fields_never_enable_a_fresh_preview(self):
+        for value in (True, False, "true"):
+            with self.subTest(generated_trust=value):
+                self.app = tui.Inbox(self.cfg, chief, 3600)
+                self.contract["trust"] = value
+                self.ui(*self.compose(), lambda: self.assert_trust_preview(False), "\x1b")
+                self.no_submission()
+
+    def test_confirmation_validates_before_preparing_or_creating(self):
+        lifecycle = self.watch_creation()
+
+        def invalidate():
+            self.app.st["new_task"]["contract"]["goal"] = " "
+
+        self.ui(*self.compose(), "t", invalidate, "\n", self.idle,
+                lambda: self.assertRegex(self.frame()[-2].lower(), r"fail|invalid|error"),
+                "\n", "\r", "KEY_ENTER", self.idle)
+        lifecycle.prepare_new_task.assert_not_called()
+        lifecycle.create_task.assert_not_called()
+        self.no_submission()
+
+    def test_cancellation_and_composer_reopening_reset_ON_to_OFF(self):
+        before = self.artifacts()
+        self.ui(*self.compose(), "t", lambda: self.assert_trust_preview(True), "\x1b",
+                *self.compose("After preview cancellation"), lambda: self.assert_trust_preview(False), "\x1b",
+                "N", self.input_open, *"cancel this composer", "\x1b",
+                *self.compose("Fresh task"), lambda: self.assert_trust_preview(False), "\x1b")
+        self.no_submission()
+        self.assertEqual(self.artifacts(), before)
+
+    def test_successful_creation_resets_the_next_composer_to_OFF(self):
+        lifecycle = self.watch_creation()
+        self.ui(*self.compose(), "t", "\n", self.idle,
+                *self.compose("Another task"), lambda: self.assert_trust_preview(False), "\x1b")
+        self.assert_created_trust(lifecycle, True, set())
+
+    def test_start_failure_cannot_resubmit_and_the_next_composer_is_OFF(self):
+        self.patch_object(chief, "tick", return_value=[])
+        self.start.side_effect = RuntimeError("session launcher unavailable")
+        self.ui(*self.compose(), "t", "\n", self.idle,
+                "t", "\n", "\r", "KEY_ENTER", self.idle,
+                *self.compose("Retry task"), lambda: self.assert_trust_preview(False), "\x1b")
+        self.start.assert_called_once()
+        self.assertEqual(len(chief.all_tasks()), 1)
+        self.assertIs(chief.all_tasks()[0]["trust"], True)
+
+    def test_successful_edits_preserve_OFF_and_ON_despite_opposite_JSON_trust(self):
+        lifecycle = self.watch_creation()
+        for expected in (False, True):
+            with self.subTest(trust=expected):
+                self.app = tui.Inbox(self.cfg, chief, 3600)
+                lifecycle.reset_mock()
+                self.start.reset_mock()
+                previous_ids = {task["id"] for task in chief.all_tasks()}
+
+                def edit(cmd):
+                    path = Path(cmd[-1])
+                    contract = json.loads(path.read_text(encoding="utf-8"))
+                    contract.update(goal="Edited CSV contract", trust=not expected)
+                    path.write_text(json.dumps(contract), encoding="utf-8")
+                    return 0
+
+                with mock.patch.dict(os.environ, {"EDITOR": "fake-editor"}), \
+                        mock.patch.object(tui.subprocess, "call", side_effect=edit) as editor:
+                    self.ui(*self.compose(), *(["t"] if expected else []), "e",
+                            lambda: self.assert_trust_preview(expected),
+                            lambda: self.preview("Edited CSV contract"), "\n", self.idle)
+                editor.assert_called_once()
+                task = self.assert_created_trust(lifecycle, expected, previous_ids)
+                self.assertEqual(task["goal"], "Edited CSV contract")
+
+    def test_editor_failures_and_invalid_edits_preserve_selected_trust_for_creation(self):
+        lifecycle = self.watch_creation()
+        for expected in (False, True):
+            for failure in ("exit", "missing-editor", "interrupt", "bad-json", "invalid-contract"):
+                with self.subTest(trust=expected, failure=failure):
+                    self.app = tui.Inbox(self.cfg, chief, 3600)
+                    lifecycle.reset_mock()
+                    self.start.reset_mock()
+                    self.terminal_events.clear()
+                    previous_ids = {task["id"] for task in chief.all_tasks()}
+
+                    def edit(cmd):
+                        path = Path(cmd[-1])
+                        if failure == "missing-editor":
+                            raise OSError("editor unavailable")
+                        if failure == "interrupt":
+                            raise KeyboardInterrupt()
+                        content = dict(self.contract, trust=not expected, goal=" ")
+                        path.write_text("{broken" if failure == "bad-json" else json.dumps(content), encoding="utf-8")
+                        return 2 if failure == "exit" else 0
+
+                    with mock.patch.dict(os.environ, {"EDITOR": "fake-editor"}), \
+                            mock.patch.object(tui.subprocess, "call", side_effect=edit) as editor:
+                        self.ui(*self.compose(), *(["t"] if expected else []), "e", self.preview,
+                                lambda: self.assert_trust_preview(expected),
+                                lambda: self.assertRegex(self.frame()[-2].lower(), r"fail|invalid|could not|error"),
+                                "\n", self.idle)
+                    editor.assert_called_once()
+                    self.assertEqual(self.terminal_events, ["saved", "ended", "restored"])
+                    self.scr.clear.assert_called()
+                    task = self.assert_created_trust(lifecycle, expected, previous_ids)
+                    self.assertEqual(task["goal"], self.contract["goal"])
+
+    def test_busy_preview_ignores_toggle_edit_and_submission_and_preserves_ON(self):
+        lifecycle = self.watch_creation()
+        tick = self.patch_object(chief, "tick", return_value=[])
+        editor = self.patch_object(tui.subprocess, "call")
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def work():
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("test job blocked terminal input")
+
+        def busy():
+            self.assertTrue(self.app.job("test busy job", work, refresh=False))
+            self.assertTrue(entered.wait(1))
+
+        def guarded():
+            try:
+                self.assertTrue(self.app.st["busy"])
+                self.no_submission()
+                lifecycle.prepare_new_task.assert_not_called()
+                editor.assert_not_called()
+                tick.assert_not_called()
+            finally:
+                release.set()
+
+        self.ui(*self.compose(), "t", busy, "t", "e", "\n", "\r", "KEY_ENTER", "N", guarded,
+                self.idle, lambda: self.assert_trust_preview(True), "\n", self.idle)
+        self.assert_created_trust(lifecycle, True, set())
+
+    def test_starting_guards_ignore_toggle_cancel_edit_and_duplicate_submissions_even_without_busy(self):
+        lifecycle = self.watch_creation()
+        tick = self.patch_object(chief, "tick", return_value=[])
+        editor = self.patch_object(tui.subprocess, "call")
+        for clear_busy in (False, True):
+            with self.subTest(clear_busy=clear_busy):
+                lifecycle.reset_mock()
+                self.start.reset_mock()
+                previous_ids = {task["id"] for task in chief.all_tasks()}
+                entered, release = threading.Event(), threading.Event()
+                self.addCleanup(release.set)
+
+                def start(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(2):
+                        raise RuntimeError("startup blocked terminal input")
+                    return self.start_contract(*args, **kwargs)
+
+                self.start.side_effect = start
+
+                def starting():
+                    self.assertTrue(entered.wait(1))
+                    self.assertEqual(self.app.st["new_task"]["phase"], "starting")
+                    if clear_busy:
+                        self.app.st["busy"] = None
+
+                def guarded():
+                    try:
+                        self.assertEqual(self.app.st["new_task"]["phase"], "starting")
+                        lifecycle.prepare_new_task.assert_called_once()
+                        self.start.assert_called_once()
+                        editor.assert_not_called()
+                        tick.assert_not_called()
+                    finally:
+                        release.set()
+
+                self.ui(*self.compose(), "t", "\n", starting, "t", "e", "\x1b", "N", "q",
+                        "\n", "\r", "KEY_ENTER", guarded, self.idle, "\n", self.idle)
+                self.assert_created_trust(lifecycle, True, previous_ids)
+
+    def test_t_while_drafting_is_ignored_and_does_not_enable_the_preview_or_tick(self):
+        tick = self.patch_object(chief, "tick", return_value=[])
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def draft(*args):
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("drafting blocked terminal input")
+            return self.draft_contract(*args)
+
+        self.draft.side_effect = draft
+        self.ui("N", *"Import CSV", "\n", lambda: self.assertTrue(entered.wait(1)),
+                "t", "T", "\n", "KEY_ENTER", release.set, self.idle,
+                lambda: self.assert_trust_preview(False), "\x1b")
+        tick.assert_not_called()
+        self.no_submission()
+
+    def test_t_keeps_normal_inbox_tick_behavior_after_preview_cancellation(self):
+        tick = self.patch_object(chief, "tick", return_value=[])
+        self.ui(*self.compose(), "t", "\x1b", "t", self.idle)
+        tick.assert_called_once_with(self.cfg)
+        self.no_submission()
+
+    def test_t_preserves_scroll_position_and_existing_preview_scroll_keys(self):
+        self.contract["checks"] = ["echo contract-line-{:02d}".format(i) for i in range(60)]
+        self.scr.getmaxyx.return_value = (12, 240)
+        positions = []
+
+        def remember():
+            positions.append(self.app.st["scroll"])
+
+        def unchanged():
+            self.assertEqual(self.app.st["scroll"], positions[0])
+            self.assertIn("t trust: on", self.frame(height=12)[-1])
+
+        self.ui(*self.compose(), "KEY_NPAGE", remember, "t", unchanged,
+                " ", remember, "KEY_PPAGE", remember, "\x1b")
+        self.assertEqual(positions, [5, 10, 5])
+        self.no_submission()
+
+
 class GroupAndRenderingTests(InboxFixture):
     def grouped_items(self):
         def delegated(sid, title, level):
@@ -667,6 +975,22 @@ class GroupAndRenderingTests(InboxFixture):
 
 
 class InboxDocumentationTests(unittest.TestCase):
+    def test_both_inbox_help_languages_document_preview_trust_and_manual_kickoff(self):
+        for lang in ("en", "zh"):
+            with self.subTest(lang=lang), mock.patch.object(chief, "LANG", lang):
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output), self.assertRaises(SystemExit) as exited:
+                    chief.argument_parser().parse_args(["inbox", "--help"])
+                self.assertEqual(exited.exception.code, 0)
+                text = re.sub(r"\s+", " ", output.getvalue())
+                self.assertRegex(text, r"\bt\b")
+                self.assertRegex(text, r"chief\.py kickoff <(?:id|task-id)>")
+                patterns = ((r"preview", r"trust", r"default.*off|off.*default",
+                             r"per.task|each task|this task only", r"confirm.*session") if lang == "en" else
+                            (r"预览", r"信任", r"默认.*(?:关|OFF)", r"每个任务|本次任务|当前任务|单个任务", r"会话.*确认"))
+                for pattern in patterns:
+                    self.assertRegex(text.lower() if lang == "en" else text, pattern)
+
     def test_README_documents_delegation_keys_and_both_work_groups(self):
         readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
         inbox = readme.split("### 📥 The inbox", 1)[1].split("\n### ", 1)[0]
