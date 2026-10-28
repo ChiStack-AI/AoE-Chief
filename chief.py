@@ -894,14 +894,17 @@ def allowed_change_lines(task, scope=None, english=False):
 
 TASKS = ROOT / "tasks"
 ACTIVE = ("running", "needs-you", "review")
-# Match whole question lines, allowing terminal borders but not quoted questions in prose.
+# Match whole question lines, allowing terminal borders but not quoted questions in prose. Codex 0.165 continues
+# its question with explanatory text, so that form only counts when its "Trust and continue" option follows.
 TRUST_RE = re.compile(
     r"^[ \t│┃]*(?:Trust this folder\?|Do you trust the files in this folder\??|"
     r"(?P<claude>(?:Quick safety check:[ \t]*)?Is this a project you created or one you trust\?"
-    r"(?: \([^\r\n]*)?))[ \t│┃]*$", re.M)
+    r"(?: \([^\r\n]*)?)|"
+    r"(?P<codex>Trust this folder\? [^\r\n]*(?=(?:\r?\n[^\r\n]*){0,3}?\r?\n[ \t│┃]*[›❯]?[ \t]*"
+    r"(?:1[.)][ \t]+)?Trust and continue[ \t│┃]*$)))[ \t│┃]*$", re.M)
 TRUST_OPTION_RE = re.compile(
-    r"^[ \t│┃]*(?P<selected>❯)?[ \t]*(?:(?P<number>[1-9][0-9]*)[.)][ \t]+)?"
-    r"(?:(?P<yes>Yes, I trust this folder)|No, exit)[ \t│┃]*$", re.M)
+    r"^[ \t│┃]*(?P<selected>[❯›])?[ \t]*(?:(?P<number>[1-9][0-9]*)[.)][ \t]+)?"
+    r"(?:(?P<yes>Yes, I trust this folder|Trust and continue)|No, exit|Quit)[ \t│┃]*$", re.M)
 # The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
 # shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
 INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
@@ -1234,14 +1237,14 @@ def at_prompt(status, sc):
     tail = (sc or "")[-800:]
     return status in ("idle", "waiting") and bool(INPUT_RE.search(tail)) and not ASK_PATTERNS.search(tail)
 
-def answer_trust_menu(cfg, sid, target, sc):
-    """Use a displayed numeric shortcut or confirm Yes from a fresh menu capture."""
+def answer_trust_menu(cfg, sid, target, sc, numbers=True):
+    """Use a displayed numeric shortcut (if numbers) or confirm Yes from a fresh menu capture."""
     options = list(TRUST_OPTION_RE.finditer(sc))
     yes = [option for option in options if option.group("yes")]
     selected = [option for option in options if option.group("selected")]
     if len(yes) != 1 or len(selected) != 1:
         return False
-    if all(option.group("number") for option in options):
+    if numbers and all(option.group("number") for option in options):
         call(["tmux", "send-keys", "-t", target, yes[0].group("number"), "Enter"], timeout=5)
         return True
     # Unnumbered menus can start on No. Never send Enter until a new capture shows Yes.
@@ -1290,8 +1293,9 @@ def wait_ready(cfg, sid, trust, timeout=120):
             if target:
                 no_selected = any(option.group("selected") and not option.group("yes")
                                   for option in TRUST_OPTION_RE.finditer(sc))
-                if trust_prompt.group("claude") or no_selected:
-                    if not answer_trust_menu(cfg, sid, target, sc):
+                codex = trust_prompt.group("codex")  # a digit may confirm at once, so select with arrows
+                if trust_prompt.group("claude") or codex or no_selected:
+                    if not answer_trust_menu(cfg, sid, target, sc, numbers=not codex):
                         return "trust"
                 else:
                     call(["tmux", "send-keys", "-t", target, "Enter"], timeout=5)
