@@ -1337,6 +1337,15 @@ def codex_update_note(cfg, t, action="kickoff"):
         "then run chief.py {} {}",
         "Chief 从不更新或跳过此菜单。请自行升级 Codex，或在会话中按 Esc 跳过菜单，然后运行 chief.py {} {}").format(action, t["id"])
 
+def agent_command(cfg, tool):
+    """The command to launch for a tool, from config "commands" (e.g. {"claude": "claude-proxy"}); None keeps the default."""
+    return ((cfg.get("commands") or {}).get(tool) or "").strip() or None
+
+def with_agent_command(cfg, cmd, tool):
+    """Append AoE's --cmd-override when the tool has a configured command."""
+    c = agent_command(cfg, tool)
+    return cmd + ["--cmd-override", c] if c else cmd
+
 def add_command(cfg, t, dry_run=False):
     """Prepare the local task branch so AoE reuses it instead of choosing a remote base."""
     if not dry_run:
@@ -1348,7 +1357,7 @@ def add_command(cfg, t, dry_run=False):
     for k in ("model", "effort"):
         if t.get(k):
             cmd += ["--" + k, t[k]]
-    return cmd
+    return with_agent_command(cfg, cmd, t["tool"])
 
 def start_task(cfg, t, trust=False):
     out = call(add_command(cfg, t), timeout=120)
@@ -2236,7 +2245,7 @@ def rotate_task(cfg, t, it, reason):
     for k in ("model", "effort"):
         if t.get(k):
             cmd += ["--" + k, t[k]]
-    out = call(cmd, timeout=120)
+    out = call(with_agent_command(cfg, cmd, t["tool"]), timeout=120)
     sid = re.search(r"^\s*ID:\s*([0-9a-f]{16})", out, re.M)
     if not sid:
         raise RuntimeError(L("rotation failed: no session ID in the aoe add output:\n", "换会话失败，没能解析出新会话 ID：\n") + out[-600:])
@@ -2768,17 +2777,26 @@ DEFAULT_MODELS = {
 def pick_model(cfg, engine, level, model=None, effort=None):
     spec = dict(DEFAULT_MODELS[engine][str(level)])
     spec.update(cfg.get("models", {}).get(engine, {}).get(str(level), {}))
+    if agent_command(cfg, engine):
+        spec["command"] = agent_command(cfg, engine)       # Chief's own AI calls use the same launcher
     if model:
         spec["model"] = model
     if effort:
         spec["effort"] = effort
     return spec
 
+def command_path(c):
+    """A configured command as an executable path: a bare name is looked up on PATH, ~ is expanded."""
+    if not c:
+        return None
+    c = os.path.expanduser(c)
+    return c if os.sep in c else (shutil.which(c) or c)
+
 def generate_ai(prompt, engine, spec, cwd=None, read_files=False, timeout=None, process_owner=None):
     """With read_files=True the model may read files in cwd (for reviews); otherwise it gets no tools at all."""
     cwd = cwd or str(ROOT)
     if engine == "claude":
-        binary = shutil.which("claude") or str(Path.home()/".local/bin/claude")
+        binary = command_path(spec.get("command")) or shutil.which("claude") or str(Path.home()/".local/bin/claude")
         cmd = [binary, "-p", "--no-session-persistence", "--tools", "Read,Grep,Glob" if read_files else "",
                "--output-format", "text"]
         if spec.get("model"):
@@ -2788,7 +2806,7 @@ def generate_ai(prompt, engine, spec, cwd=None, read_files=False, timeout=None, 
         output = call(cmd, timeout=timeout or 180, input_text=prompt, cwd=cwd,
                       **({"process_owner": process_owner} if process_owner is not None else {}))
     else:
-        binary = shutil.which("codex") or str(Path.home()/".npm-global/bin/codex")
+        binary = command_path(spec.get("command")) or shutil.which("codex") or str(Path.home()/".npm-global/bin/codex")
         cmd = [binary, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check"]
         if spec.get("model"):
             cmd += ["-m", spec["model"]]
@@ -3653,7 +3671,8 @@ def main(argv=None):
             for eng in ("codex", "claude"):
                 for lv in (1, 2, 3):
                     s = pick_model(cfg, eng, lv)
-                    print("  {}{} L{}: {} · effort={}".format("*" if eng == cur else " ", eng, lv, s["model"], s["effort"]))
+                    print("  {}{} L{}: {} · effort={}{}".format("*" if eng == cur else " ", eng, lv, s["model"], s["effort"],
+                                                              " · via " + s["command"] if s.get("command") else ""))
             print(L("Override in config.json: ", "覆盖方式：config.json 中加入 ") +
                   "\"models\": {\"codex\": {\"1\": {\"model\": \"...\", \"effort\": \"...\"}}}")
         elif args.command == "inbox":

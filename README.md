@@ -565,9 +565,36 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
 | `review`, `review_engine`, `review_level` | `true`, the other engine, 2 | Cross review |
 | `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
+| `commands` | `{}` | Launch a tool through your own command, e.g. `{"claude": "claude-proxy"}`. See below |
 
 If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set
 `AOE_BIN`.
+
+**Launching an agent through a wrapper.** Use `commands` when an agent must start through your own script rather
+than its plain binary: an API proxy or model router, a pinned version, extra environment variables, a sandbox. The
+command is used everywhere Chief starts that tool:
+
+- `chief new` and session rotation pass it to `aoe add --cmd-override`. AoE stores it with the session, so restarts
+  and resumes go through it too;
+- Chief's own AI calls with that engine (briefs, decision drafts, cross reviews).
+
+A wrapper must:
+
+1. pass every argument through. AoE adds `--session-id` / `--resume`, and Chief adds `-p` and `--model`;
+2. `exec` the real binary, so AoE sees the agent's own process and screen;
+3. keep the agent's transcript directory (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), or export the same value to Chief,
+   because Chief reads progress from those transcripts;
+4. be on the `PATH` that tmux sessions see, or be given as an absolute path.
+
+```bash
+#!/usr/bin/env bash
+# ~/.local/bin/claude-proxy: send Claude Code's API traffic through a local proxy
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+exec claude "$@"
+```
+
+Resume a conversation through the same wrapper that created it. A conversation that went through a proxy may contain
+content the plain endpoint rejects.
 
 </details>
 
