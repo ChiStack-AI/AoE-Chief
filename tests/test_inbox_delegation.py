@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import subprocess
 import sys
@@ -992,7 +993,7 @@ class InboxDocumentationTests(unittest.TestCase):
                     self.assertRegex(text.lower() if lang == "en" else text, pattern)
 
     def test_README_documents_delegation_keys_and_both_work_groups(self):
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        readme = read_documentation()
         inbox = readme.split("### 📥 The inbox", 1)[1].split("\n### ", 1)[0]
         for key in ("N", "Tab", "Enter", "e", "Esc", "n"):
             self.assertIn("`" + key + "`", inbox)

@@ -9,6 +9,7 @@ those expectations conflict with this contract's transient detail behavior.
 import io
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import unittest
 from unittest import mock
@@ -510,7 +511,7 @@ class ErrorAndCancellationLogTests(UnifiedLogFixture):
 class UnifiedLogDocumentationTests(unittest.TestCase):
     def test_readme_explains_combined_retention_transient_details_and_L_navigation(self):
         root = Path(__file__).resolve().parent.parent
-        text = (root / "README.md").read_text(encoding="utf-8")
+        text = read_documentation()
         section = re.split(r"\n#{2,3} ", text.split("### 📥 The inbox", 1)[1], maxsplit=1)[0]
         self.assertRegex(section, r"`L`")
         flat = re.sub(r"\s+", " ", section).lower()

@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import subprocess
 import threading
@@ -467,7 +468,7 @@ class AIErrorTests(support.AssistantFixture):
 class AssistantDocumentationTests(unittest.TestCase):
     def test_readme_inbox_section_documents_question_lifecycle_suggestions_and_errors(self):
         root = Path(__file__).resolve().parent.parent
-        text = (root / "README.md").read_text(encoding="utf-8")
+        text = read_documentation()
         section = re.split(r"\n#{2,3} ", text.split("### 📥 The inbox", 1)[1], maxsplit=1)[0].lower()
         for pattern in (r"`\?`", r"question", r"enter", r"non.?empty|non.?blank", r"thinking",
                         r"esc.*cancel|cancel.*esc", r"pgup.*pgdn", r"suggestion", r"prefill|pre-fill",

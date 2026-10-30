@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import tempfile
 import unittest
@@ -524,7 +525,7 @@ class AntigravityConfigurationAcceptanceTests(AntigravityFixture):
                 self.assertRegex(text, r"--tool\s+\{[^}]*antigravity[^}]*\}")
 
     def test_readme_documents_worker_and_native_storage(self):
-        readme = (SOURCE.parent / "README.md").read_text(encoding="utf-8")
+        readme = read_documentation()
         self.assertTrue("--tool antigravity" in readme, "README must show --tool antigravity")
         self.assertTrue(re.search(r"(?i)Antigravity.*agy|agy.*Antigravity", readme),
                         "README must identify Antigravity CLI as agy")

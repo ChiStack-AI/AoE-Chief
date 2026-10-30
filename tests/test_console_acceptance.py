@@ -6,6 +6,7 @@ only against an isolated copied installation and a mocked curses entry point.
 import json
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import subprocess
 import sys
@@ -284,7 +285,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertRegex(console, r"home|~")
 
     def test_readme_explains_restricted_commands_completion_history_confirmation_and_cancellation(self):
-        readme = re.sub(r"\s+", " ", (REPO / "README.md").read_text()).lower()
+        readme = re.sub(r"\s+", " ", read_documentation()).lower()
         for phrase in ("chief console", "command bar", "tab", "history", "y/n", "esc"):
             self.assertTrue(phrase in readme, "README should explain " + phrase)
         for name in support.CHIEF_COMMANDS + support.SESSION_COMMANDS:
@@ -303,7 +304,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertRegex(readme, r"(?:shell.*(?:pipeline|redirection)|(?:pipeline|redirection).*shell)")
 
     def test_readme_documents_default_split_current_window_and_configurable_home_directory(self):
-        readme = re.sub(r"\s+", " ", (REPO / "README.md").read_text()).lower()
+        readme = re.sub(r"\s+", " ", read_documentation()).lower()
         for phrase in ("chief console", "--layout top-bottom", "--shell-cwd"):
             self.assertTrue(phrase in readme, "README should explain " + phrase)
         self.assertRegex(readme, r"(?:current|existing).{0,70}(?:tmux )?window")
@@ -311,7 +312,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertRegex(readme, r"half.{0,20}width|narrow")
 
     def test_readme_points_aoe_chief_custom_agent_to_console_and_preserves_launch_example(self):
-        source = (REPO / "README.md").read_text()
+        source = read_documentation()
         blocks = re.findall(r"```toml\s*\n(.*?)```", source, re.S | re.I)
         commands = [match.group(2) for block in blocks if "custom_agents" in block
                     for match in re.finditer(r'''(?<![\w-])chief\s*=\s*(["'])(.*?)\1''', block)]

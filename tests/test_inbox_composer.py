@@ -8,6 +8,7 @@ from collections import deque
 import math
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import threading
 import time
@@ -563,7 +564,7 @@ class PasteBatchingTests(ComposerFixture):
 
 class ComposerDocumentationTests(unittest.TestCase):
     def inbox_docs(self):
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        readme = read_documentation()
         section = re.split(r"\n#{2,3} ", readme.split("### 📥 The inbox", 1)[1], maxsplit=1)[0]
         return re.sub(r"\s+", " ", section).lower()
 

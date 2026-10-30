@@ -6,6 +6,7 @@ the AoE boundary is simulated: no live sessions or user worktrees are touched.
 import copy
 import json
 from pathlib import Path
+from documentation_support import read_documentation
 import shutil
 import subprocess
 import sys
@@ -710,7 +711,7 @@ class TaskDisplayAndHelpTests(CleanupFixture):
         self.assertRegex(out.lower(), r"archiv")
 
     def test_readme_documents_cleanup_archive_and_progress_preservation(self):
-        readme = (Path(chief.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        readme = read_documentation()
         self.assertIn("chief clean", readme)
         self.assertIn("--branches", readme)
         self.assertIn("--dry-run", readme)

@@ -10,6 +10,7 @@ by worker output, feedback, dismissal, an autonomy mode, or a successful check.
 import copy
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
+from documentation_support import read_documentation
 from unittest import mock
 
 import chief
@@ -890,7 +891,7 @@ class ProtectedApprovalVisibilityTests(ProtectedApprovalFixture):
         self.assertRegex(stale.lower(), r"(?:further|changed|mismatch|stale|again|renew)")
 
     def test_readme_documents_deliverable_allowances_and_version_bound_existing_changes(self):
-        text = (Path(chief.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        text = read_documentation()
         self.assertTrue("New files in protected paths:" in text, "README must name the deliverable approval decision")
         self.assertTrue("Allow changes to protected" in text, "README must name the protected-state approval decision")
         self.assertRegex(text.lower(), r"exact[^.\n]*path")

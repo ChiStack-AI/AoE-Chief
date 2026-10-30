@@ -8,6 +8,7 @@ from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdo
 import io
 import os
 from pathlib import Path
+from documentation_support import read_documentation
 import re
 import shutil
 import sys
@@ -253,14 +254,14 @@ class InboxSourceUpdateTests(SourceUpdateFixture):
 
 class ApprovalAndUpdateDocumentationTests(ChiefFixture):
     def test_readme_explains_durable_permissions_queued_notices_and_uncertain_delivery(self):
-        text = (Path(chief.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        text = read_documentation()
         approval = text[text.index("Use Inbox **`a approve paths`"):text.index("Approved paths, approval types")]
         self.assertRegex(approval.lower(), r"(?:busy|stopped|missing|unavailable)")
         self.assertRegex(approval.lower(), r"queu[\s\S]*tick")
         self.assertRegex(approval.lower(), r"(?:unconfirmed|not confirmed|uncertain)[\s\S]*(?:retry|resend|re-send)")
 
     def test_readme_explains_watch_boundary_reload_and_manual_inbox_restart(self):
-        text = (Path(chief.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        text = read_documentation()
         updates = text[text.index("**Updating Chief:"):text.index("**Changing `custom_agents`:")]
         self.assertRegex(updates.lower(), r"watch[\s\S]*(?:hash|content)")
         self.assertRegex(updates.lower(), r"(?:before|between|next)[\s\S]*(?:pass|iteration|tick)")

@@ -5,6 +5,7 @@ paths. Only terminal/process boundaries are simulated; no detector API is impose
 """
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
+from documentation_support import read_documentation
 import json
 import re
 from types import SimpleNamespace
@@ -388,7 +389,7 @@ class CodexUpdateMessageTests(ChiefFixture):
 
 class CodexUpdateDocumentationTests(unittest.TestCase):
     def test_readme_documents_menu_nonintervention_prefix_risk_and_recovery_commands(self):
-        text = (Path(chief.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        text = read_documentation()
         # A short contiguous paragraph/list must connect the policy and recovery;
         # unrelated mentions elsewhere in this large README cannot satisfy it.
         section = re.search(r"(?is)Codex[^\n]*(?:update menu|startup update)[\s\S]{0,1800}", text)
