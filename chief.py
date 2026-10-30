@@ -56,6 +56,8 @@ ARCHIVE = ROOT / "reports"
 AOE_HOME = Path(os.environ.get("AOE_HOME", str(Path.home()/".config/agent-of-empires")))
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home()/".claude")))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex")))
+# agy stores conversations here; do not invent an undocumented environment override.
+ANTIGRAVITY_HOME = Path.home()/".gemini"/"antigravity-cli"
 STALE_HOURS = 6
 
 # ---------- Language ----------
@@ -367,13 +369,64 @@ def codex_events(rows):
             ev.append((ts, "error", str(p.get("message", ""))))
     return [(ts, kind, redact(text)) for ts, kind, text in ev]
 
+def antigravity_file(rec):
+    """AoE has no agent_session_id for agy; each task's workspace selects its conversation."""
+    workspace = rec.get("project_path")
+    if not isinstance(workspace, str) or not os.path.isabs(workspace):
+        return None
+    conversations = load_json(ANTIGRAVITY_HOME/"cache"/"last_conversations.json", {})
+    sid = conversations.get(workspace) if isinstance(conversations, dict) else None
+    if not isinstance(sid, str) or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", sid):
+        return None
+    path = ANTIGRAVITY_HOME/"brain"/sid/".system_generated"/"logs"/"transcript.jsonl"
+    return str(path) if path.is_file() else None
+
+def antigravity_events(rows):
+    """Normalize agy steps, keeping tool results as activity rather than replies or errors."""
+    ev = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ts, kind = r.get("created_at"), r.get("type")
+        content = r.get("content")
+        text = content if isinstance(content, str) else ""
+        if kind == "USER_INPUT":
+            request = re.search(r"<USER_REQUEST>(?:\r?\n)?(.*?)(?:\r?\n)?</USER_REQUEST>", text, re.S)
+            ev.append((ts, "prompt", request.group(1) if request else text))
+        elif kind == "PLANNER_RESPONSE":
+            if text.strip():
+                ev.append((ts, "reply", text))
+            calls = r.get("tool_calls") or []
+            if isinstance(calls, list) and calls:
+                ev.extend((ts, "tool", "") for call in calls if isinstance(call, dict))
+            elif text.strip() and r.get("status") == "DONE":
+                ev.append((ts, "done", ""))
+            else:
+                ev.append((ts, "activity", ""))
+        elif kind == "GENERIC":
+            # A command exiting nonzero is not an agent failure; its timestamp still matters.
+            ev.append((ts, "activity", ""))
+    return [(ts, kind, redact(text)) for ts, kind, text in ev]
+
+def antigravity_title(source):
+    sid = Path(source).parents[2].name
+    try:
+        annotation = (ANTIGRAVITY_HOME/"annotations"/(sid + ".pbtxt")).read_text(encoding="utf-8")
+        match = re.search(r'^\s*title\s*:\s*("(?:[^"\\]|\\.)*")', annotation, re.M)
+        return redact(json.loads(match.group(1))) if match else ""
+    except (OSError, ValueError):
+        return ""
+
 def transcript(rec):
     """Return {source, goal, title, last_prompt, last_reply, footer, turn, error, tools, last_ts, turns_total} or None."""
     sid = rec.get("agent_session_id")
     tool = rec.get("tool")
-    if not sid:
+    if tool == "antigravity":
+        f = antigravity_file(rec)
+        files, parse = ([f] if f else []), antigravity_events
+    elif not sid:
         return None
-    if tool == "claude":
+    elif tool == "claude":
         files = claude_files(sid)
         parse = claude_events
     elif tool == "codex":
@@ -387,18 +440,23 @@ def transcript(rec):
     ev, src = [], None
     for f in reversed(files):           # the end of the chain may be a title-only stub; fall back to one with messages
         size = 2*1024*1024
-        while True:
-            ev = parse(read_jsonl(f, tail_bytes=size))
-            if any(k == "prompt" for _, k, _ in ev) or size >= os.path.getsize(f):
-                break
-            size *= 4
+        try:
+            while True:
+                # Read all agy turns for the goal and round budget, not just the most recent tail.
+                ev = parse(read_jsonl(f, tail_bytes=None if tool == "antigravity" else size))
+                if tool == "antigravity" or any(k == "prompt" for _, k, _ in ev) or size >= os.path.getsize(f):
+                    break
+                size *= 4
+        except OSError:
+            continue
         if ev:
             src = f
             break
     if not ev:
         return None
-    goal = next((t for _, k, t in parse(head_jsonl(files[0])) if k == "prompt"), "")
-    title = ""
+    goal_events = ev if tool == "antigravity" else parse(head_jsonl(files[0]))
+    goal = next((t for _, k, t in goal_events if k == "prompt"), "")
+    title = antigravity_title(src) if tool == "antigravity" else ""
     if tool == "claude":                 # AoE titles are often "resume"; Claude's own title is more useful
         for f in files:
             for r in read_jsonl(f, tail_bytes=200000):
@@ -426,14 +484,22 @@ def transcript(rec):
 def recent_turns(rec, n):
     """For drill-down: the last n turns as (prompt, replies)."""
     sid, tool = rec.get("agent_session_id"), rec.get("tool")
-    if tool == "claude":
+    if tool == "antigravity":
+        f = antigravity_file(rec)
+        files, parse = ([f] if f else []), antigravity_events
+    elif tool == "claude":
         files, parse = claude_files(sid or ""), claude_events
-    else:
+    elif tool == "codex":
         f = codex_file(sid or "")
         files, parse = ([f] if f else []), codex_events
+    else:
+        return []
     ev = []
     for f in reversed(files):
-        ev = parse(read_jsonl(f, tail_bytes=8*1024*1024))
+        try:
+            ev = parse(read_jsonl(f, tail_bytes=None if tool == "antigravity" else 8*1024*1024))
+        except OSError:
+            continue
         if ev:
             break
     turns, cur = [], None
@@ -442,6 +508,8 @@ def recent_turns(rec, n):
             cur = {"ts": ts, "prompt": t, "replies": [], "tools": 0, "state": "open"}
             turns.append(cur)
         elif cur is not None:
+            if k in ("reply", "tool", "activity"):
+                cur["state"] = "open"
             if k == "reply":
                 cur["replies"].append(t)
             elif k == "tool":
@@ -491,6 +559,7 @@ def parse_footer(reply):
 
 # An approval prompt starts its line; the same words inside a reply ("Decision needed: Approve the tests?") are prose.
 ASK_PATTERNS = re.compile(r"^[ \t│|›❯>•*-]*(?:Do you want to|Would you like to|(?:Allow|[Aa]pprove)\b|Press enter|Yes, and|允许|是否继续)"
+                          r"|^[ \t│┃|›❯>]*(?:Accept this file edit\?|Run this command\?)[ \t│┃|]*$"
                           r"|\(y/n\)|\[Y/n\]", re.M)
 
 # ---------- Screen / git / artifacts ----------
@@ -905,12 +974,13 @@ ACTIVE = ("running", "needs-you", "review")
 # its question with explanatory text, so that form only counts when its "Trust and continue" option follows.
 TRUST_RE = re.compile(
     r"^[ \t│┃]*(?:Trust this folder\?|Do you trust the files in this folder\??|"
+    r"(?P<antigravity>Do you trust the contents of this project\?)|"
     r"(?P<claude>(?:Quick safety check:[ \t]*)?Is this a project you created or one you trust\?"
     r"(?: \([^\r\n]*)?)|"
     r"(?P<codex>Trust this folder\? [^\r\n]*(?=(?:\r?\n[^\r\n]*){0,3}?\r?\n[ \t│┃]*[›❯]?[ \t]*"
     r"(?:1[.)][ \t]+)?Trust and continue[ \t│┃]*$)))[ \t│┃]*$", re.M)
 TRUST_OPTION_RE = re.compile(
-    r"^[ \t│┃]*(?P<selected>[❯›])?[ \t]*(?:(?P<number>[1-9][0-9]*)[.)][ \t]+)?"
+    r"^[ \t│┃]*(?P<selected>[❯›>])?[ \t]*(?:(?P<number>[1-9][0-9]*)[.)][ \t]+)?"
     r"(?:(?P<yes>Yes, I trust this folder|Trust and continue)|No, exit|Quit)[ \t│┃]*$", re.M)
 # Require a whole version heading and an Update now option within the next four lines.
 # The boxed "✨ Update available! ... -> ..." history banner left after Esc is not a menu.
@@ -1315,7 +1385,7 @@ def wait_ready(cfg, sid, trust, timeout=120):
                 no_selected = any(option.group("selected") and not option.group("yes")
                                   for option in TRUST_OPTION_RE.finditer(sc))
                 codex = trust_prompt.group("codex")  # a digit may confirm at once, so select with arrows
-                if trust_prompt.group("claude") or codex or no_selected:
+                if trust_prompt.group("claude") or trust_prompt.group("antigravity") or codex or no_selected:
                     if not answer_trust_menu(cfg, sid, target, sc, numbers=not codex):
                         return "trust"
                 else:
@@ -2212,6 +2282,7 @@ def act(cfg, it, t, dry=False):
             save_task(t)
             log_event(t, "cap", t["note"])
         return L("auto-continue limit reached; handed to you", "达到自动继续上限，交给你")
+    # Includes agy: token counts do not establish a context window; require a displayed percentage.
     used = context_used(it.get("screen"))
     rotate = used is not None and used >= cfg.get("rotate_at", 70)
     if dry:
@@ -2669,6 +2740,8 @@ def basic(result):
                              "  - 验收 `chief.py close {0}` · 退回 `chief.py nudge {0} --review` · 审查卡 tasks/{0}/review.md").format(task["id"]))
             dec = x.get("decision")
             if dec:
+                if dec.get("draft"):
+                    out.append(L("  - Question: ", "  - 问题：") + clip(dec.get("question"), 160))
                 out.append(L("  - Handle: ", "  - 处理：") + (
                     L("`chief.py decide {0} --accept` approves and locks tests/support files and starts build; "
                       "`--reply \"...\"` sends feedback and keeps the test phase",
@@ -2693,6 +2766,7 @@ def basic(result):
 def digest(it, level):
     log = it.get("log") or {}
     n = {1: 400, 2: 1200, 3: 3000}[level]
+    reply = log.get("last_reply") or ""
     d = {"id": it["id"][:8], "title": it["title"], "tool": it.get("tool"), "status": it["status"],
          "changed_since_last_brief": it.get("changed"),
          "signals": ["{}: {}".format(l, m) for l, m, _ in it.get("signals", [])],
@@ -2702,7 +2776,7 @@ def digest(it, level):
          "budget": it["task"].get("budget"),
          "last_prompt": clip(log.get("last_prompt"), 300),
          "agent_footer": log.get("footer"),
-         "last_reply": clip(log.get("last_reply"), n),
+         "last_reply": reply if len(reply) <= n else reply[:n-1] + "…",
          "turn_state": log.get("turn"), "last_activity": ago(log.get("last_ts")),
          "git": it.get("git"), "artifact": it.get("artifact"), "scope": it.get("scope"),
          "pending_decision": it.get("decision")}
@@ -3228,15 +3302,18 @@ def argument_parser(parser_class=argparse.ArgumentParser, selected=None):
                     help=L("decision category chief may decide for you (used by AI drafting)", "允许 chief 替你定的小决策类别（AI 起草时使用）"))
     nw.add_argument("--rounds", type=int, help=L("turn budget", "轮数预算"))
     nw.add_argument("--hours", type=float, help=L("time budget in hours", "时间预算（小时）"))
-    nw.add_argument("--tool", choices=["codex", "claude"])
+    nw.add_argument("--tool", choices=["codex", "claude", "antigravity"], help=L(
+        "worker tool (antigravity launches agy; AI engines remain codex/claude)",
+        "工作工具（antigravity 启动 agy；AI 引擎仍为 codex/claude）"))
     nw.add_argument("--model")
     nw.add_argument("--effort")
     nw.add_argument("--branch", help=L("default: chief/<task id>", "默认 chief/<任务 id>"))
     nw.add_argument("--base-branch", dest="base_branch")
     nw.add_argument("--autonomy", choices=["observe", "suggest", "auto"])
     nw.add_argument("--id", dest="tid")
-    nw.add_argument("--trust", action="store_true", help=L("answer the agent's trust-this-folder prompt for you",
-                                                           "Agent 询问是否信任目录时替你确认"))
+    nw.add_argument("--trust", action="store_true", help=L(
+        "confirm the worker's folder-trust prompt; never approve file edits or commands",
+        "替工作 Agent 确认目录信任提示；不会批准文件编辑或命令"))
     nw.add_argument("--draft", action="store_true", help=L("save the contract only; do not start", "只保存合同，不启动"))
     nw.add_argument("--dry-run", action="store_true", help=L("only print the contract, the aoe command and the kickoff prompt",
                                                              "只打印合同、aoe 命令和开场指令"))

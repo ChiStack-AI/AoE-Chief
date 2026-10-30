@@ -87,8 +87,8 @@ $ chief brief
 - **🔁 Auto-continue:** when checks fail, Chief sends the failing output back to the agent. It recovers
   interrupted turns and detects stuck loops.
 - **♻️ Fresh context:** when a session's context fills up, a new session picks up from `.chief/progress.md`.
-- **🔍 Cross-model review:** Codex's work is reviewed by Claude and vice versa, and every review produces a review
-  card.
+- **🔍 Cross-model review:** Codex's work is reviewed by Claude and vice versa; Antigravity workers are reviewed
+  by Codex by default. Every review produces a review card.
 - **🧾 Learns your taste:** every override is written to `preferences.md`, and acceptance rates show what could
   be automated next.
 - **📥 Terminal inbox:** `chief inbox` lists what needs you and handles it with one key: accept a draft, reply,
@@ -101,7 +101,7 @@ $ chief brief
 ```mermaid
 flowchart LR
     you(["🧑 You"]) -- "chief new" --> board[("Task board<br/>contract · checks · decisions")]
-    board -- "worktree + kickoff" --> worker["🤖 Worker<br/>Codex / Claude Code"]
+    board -- "worktree + kickoff" --> worker["🤖 Worker<br/>Codex / Claude Code / Antigravity"]
     worker -- "end of turn" --> chief{{"🎩 chief tick"}}
     chief -- "checks fail: continue" --> worker
     chief -- "all checks pass" --> reviewer["🔍 Other model"]
@@ -124,8 +124,10 @@ Design principles:
 **Requirements:**
 - Linux or macOS, Python 3.7+ (standard library only), git
 - [Agent of Empires](https://github.com/agent-of-empires/agent-of-empires) (`aoe`, tested with 1.21)
-- [Codex CLI](https://github.com/openai/codex) and/or [Claude Code](https://github.com/anthropics/claude-code).
-  Install both to get cross-model review.
+- A worker: [Codex CLI](https://github.com/openai/codex), [Claude Code](https://github.com/anthropics/claude-code),
+  or Antigravity CLI (`agy`, transcript format based on a 1.4.11 probe).
+  Chief's AI briefs, decision drafts, and reviews use Codex or Claude. Install both for mutual Codex/Claude review;
+  Antigravity work uses Codex by default, or Claude when configured with `review_engine`.
 
 ```bash
 git clone https://github.com/lialittis/AoE-Chief.git ~/aoe-chief
@@ -178,6 +180,17 @@ Chief infers checks from pytest configuration or `tests/` (using unittest discov
 a `package.json` test script, and a Makefile `test` target. Existing `tests/` and `test/` directories become
 protected. An AI reads the repo to refine the name, goal, checks, protections and budget; unavailable or failed
 AI generation falls back to the inferred defaults. `--repo` selects another repository.
+
+Choose a worker with `--tool codex`, `--tool claude`, or `--tool antigravity` (Codex is the default):
+
+```bash
+chief new "Make the parser accept trailing commas" --tool antigravity
+```
+
+Chief passes AoE's built-in tool name `antigravity` to `aoe add`; no custom tool or command override is needed.
+The inbox contract editor also accepts `"tool": "antigravity"`. Antigravity is a worker only: `--engine` and
+`chief engine` still offer `codex|claude`. Automatic session rotation requires a context percentage on screen;
+Chief does not estimate an agy context window from token counts.
 
 New tasks begin with a test phase: the worker writes failing acceptance tests, commits them, and asks you to
 approve the files. This is always a big decision with no Chief draft, including in auto mode. Accept it with
@@ -563,12 +576,31 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `scope_ignore` | `[]` | Extra patterns the scope and cleanup cleanliness checks ignore |
 | `decision_ai` | `false` | Let AI re-judge and draft new decisions |
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
-| `review`, `review_engine`, `review_level` | `true`, the other engine, 2 | Cross review |
+| `review`, `review_engine`, `review_level` | `true`, the other engine (Codex for Antigravity), 2 | Cross review using Codex or Claude |
 | `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
 | `commands` | `{}` | Launch a tool through your own command, e.g. `{"claude": "claude-proxy"}`. See below |
 
 If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set
 `AOE_BIN`.
+
+**Native transcripts.** Chief reads worker history locally:
+
+| Worker | Transcript location |
+|---|---|
+| Claude | `$CLAUDE_CONFIG_DIR/projects/*/<session-id>.jsonl` (default base `~/.claude`); follows continuation chains |
+| Codex | `$CODEX_HOME/sessions/*/*/*/rollout-*-<session-id>.jsonl` (default base `~/.codex`) |
+| Antigravity (`agy`) | `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` |
+
+AoE does not store an `agent_session_id` for Antigravity. Chief resolves the session's absolute workspace path
+in `~/.gemini/antigravity-cli/cache/last_conversations.json`, then reads that conversation's transcript and
+`~/.gemini/antigravity-cli/annotations/<uuid>.pbtxt` title. Chief worktrees are unique per task. The mapping is
+reread on each observation; Chief never selects another workspace's conversation as a fallback. Chief uses
+agy's standard storage directory and does not define an undocumented `ANTIGRAVITY_HOME` environment override.
+
+For agy prompts, only the `USER_REQUEST` body is shown; trailing metadata and settings blocks are excluded.
+Untagged input is kept as raw text. The last planner response supplies the reply and closing block, while tool
+calls and results update activity without masquerading as final replies. The same history feeds show, briefs,
+decisions, auto-continue, recovery, and stuck detection. Missing history falls back to screen-based observation.
 
 **Launching an agent through a wrapper.** Use `commands` when an agent must start through your own script rather
 than its plain binary: an API proxy or model router, a pinned version, extra environment variables, a sandbox. The
@@ -576,14 +608,15 @@ command is used everywhere Chief starts that tool:
 
 - `chief new` and session rotation pass it to `aoe add --cmd-override`. AoE stores it with the session, so restarts
   and resumes go through it too;
-- Chief's own AI calls with that engine (briefs, decision drafts, cross reviews).
+- Chief's own AI calls with that engine (Codex/Claude briefs, decision drafts, cross reviews).
 
 A wrapper must:
 
-1. pass every argument through. AoE adds `--session-id` / `--resume`, and Chief adds `-p` and `--model`;
+1. pass every argument through. For Codex/Claude, these include AoE's `--session-id` / `--resume` and Chief's
+   `-p` and `--model`;
 2. `exec` the real binary, so AoE sees the agent's own process and screen;
-3. keep the agent's transcript directory (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), or export the same value to Chief,
-   because Chief reads progress from those transcripts;
+3. keep the agent's transcript directory (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), or export the same value to Chief;
+   for agy, keep the same home directory so Chief can read `~/.gemini/antigravity-cli`;
 4. be on the `PATH` that tmux sessions see, or be given as an absolute path.
 
 ```bash
@@ -624,8 +657,11 @@ $AOE_CHIEF_HOME/
   work is always your call.
 - 🔐 **Checks run as you:** register only check commands you trust.
 - 🧪 **Untrusted content:** transcripts, screens and diffs are treated as untrusted data in every AI prompt.
-- 📁 **Trust prompts:** Codex's "trust this folder" prompt is answered only when you pass `--trust`. Claude's
-  newer trust prompt wording is not recognised yet, so prefer Codex workers with `--trust`.
+- 📁 **Trust prompts:** Codex, Claude, and Antigravity folder-trust prompts are answered only when the task has
+  trust enabled (`--trust`, or the inbox trust toggle). Chief verifies the affirmative menu selection before
+  confirming Antigravity's `Do you trust the contents of this project?` prompt.
+- ✋ **Worker approvals:** Antigravity's `Accept this file edit?` and `Run this command?` menus require your
+  action in the session. Chief reports waiting for approval and never accepts these menus, even with `--trust`.
 - 🙈 **Secrets masked:** passwords, tokens, API keys and private keys in transcripts and screens are masked as they
   are read, before Chief stores, shows or forwards anything.
 - ⚖️ **Big decisions need you:** they cannot be auto-accepted. Rules flag them (pushes, deletions, test changes,
@@ -686,6 +722,7 @@ The design rationale is in [docs/architecture.md](docs/architecture.md).
   Chief supervises.
 - [Codex CLI](https://github.com/openai/codex) and [Claude Code](https://github.com/anthropics/claude-code): the
   workers, and each other's reviewers.
+- Antigravity CLI (`agy`): a third worker, supervised through its native transcripts and terminal prompts.
 
 ## 📄 License
 
