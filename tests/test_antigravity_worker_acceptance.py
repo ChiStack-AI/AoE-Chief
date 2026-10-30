@@ -35,21 +35,28 @@ FINAL = ("Conclusion: Synthetic parser work is ready for review.\n"
          "Next step: review the result\n"
          "Decision needed: none")
 QUESTION = "Choose the output format. Options: A) JSON B) text. Recommendation: A"
+METADATA_TEXT = "Synthetic metadata: fixture workspace and editor context."
+SETTINGS_TEXT = "Synthetic settings change: fixture display preference."
+REQUEST_TRAILER = ("\n<ADDITIONAL_METADATA>\n" + METADATA_TEXT + "\n</ADDITIONAL_METADATA>"
+                   "\n<USER_SETTINGS_CHANGE>\n" + SETTINGS_TEXT + "\n</USER_SETTINGS_CHANGE>")
 
 
 def step(index, kind, content, **extra):
     return dict(step_index=index, source="USER_EXPLICIT" if kind == "USER_INPUT" else "MODEL",
-                type=kind, status="COMPLETED", created_at="2026-01-01T00:00:{:02d}Z".format(index),
+                type=kind, status="DONE", created_at="2026-01-01T00:00:{:02d}Z".format(index),
                 content=content, **extra)
 
 
 def prompt(index, text):
-    return step(index, "USER_INPUT", "<USER_REQUEST>\n" + text + "\n</USER_REQUEST>")
+    return step(index, "USER_INPUT", "<USER_REQUEST>\n" + text + "\n</USER_REQUEST>" + REQUEST_TRAILER)
 
 
-def reply(index, text, **extra):
-    return step(index, "PLANNER_RESPONSE", text, input_tokens=900000,
-                cache_read_tokens=800000, output_tokens=100, **extra)
+def reply(index, text=None, **extra):
+    row = step(index, "PLANNER_RESPONSE", text, input_tokens=900000,
+               cache_read_tokens=800000, output_tokens=100, **extra)
+    if text is None:
+        del row["content"]  # Real intermediate tool-call steps omit the key entirely.
+    return row
 
 
 class AntigravityFixture(unittest.TestCase):
@@ -87,7 +94,7 @@ class AntigravityFixture(unittest.TestCase):
     def rows(self, final=FINAL):
         return [prompt(0, "Fix the synthetic parser."), reply(1, "First turn finished."),
                 prompt(2, "Now handle empty input.\nKeep Unicode: 测试."),
-                reply(3, "Inspecting the fixture.", thinking="private synthetic reasoning",
+                reply(3, thinking="private synthetic reasoning",
                       tool_calls=[{"name": "read_file", "args": {"path": json.dumps("sample.py")}}]),
                 step(4, "GENERIC", "Created At: 2026-01-01T00:00:03Z\n"
                      "Completed At: 2026-01-01T00:00:04Z\nSynthetic file contents"),
@@ -108,13 +115,26 @@ class AntigravityFixture(unittest.TestCase):
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         annotation = self.base / "annotations" / (uuid + ".pbtxt")
         annotation.parent.mkdir(parents=True, exist_ok=True)
-        annotation.write_text("title: " + json.dumps(title) + "\n", encoding="utf-8")
+        annotation.write_text("title:" + json.dumps(title) + "\n", encoding="utf-8")
         return path
 
     def log(self):
         result = self.ch.transcript(self.rec)
         self.assertIsNotNone(result, "resolve agy by project_path without an agent_session_id")
         return result
+
+    def assert_no_request_envelope(self, text):
+        for excluded in (METADATA_TEXT, SETTINGS_TEXT, "<USER_REQUEST>", "</USER_REQUEST>",
+                         "<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>",
+                         "<USER_SETTINGS_CHANGE>", "</USER_SETTINGS_CHANGE>"):
+            self.assertNotIn(excluded, text)
+
+    def show_history(self):
+        with mock.patch.object(self.ch, "aoe_records", return_value={self.rec["id"]: self.rec}), \
+                mock.patch.object(self.ch, "scope_info", return_value=None), \
+                mock.patch.object(self.ch, "git_info", return_value=None), \
+                mock.patch.object(self.ch, "screen", return_value=READY):
+            return self.ch.show(self.cfg, self.rec["id"], 2)
 
     def item(self, log=None, screen=READY, status="idle"):
         return dict(id=self.rec["id"], title="Synthetic task", tool="antigravity", task=self.task,
@@ -140,6 +160,8 @@ class AntigravityTranscriptAcceptanceTests(AntigravityFixture):
         self.assertEqual(log["goal"], "Fix the synthetic parser.")
         self.assertEqual(log["title"], 'Synthetic "parser" task')
         self.assertEqual(log["last_prompt"], "Now handle empty input.\nKeep Unicode: 测试.")
+        self.assert_no_request_envelope(log["goal"])
+        self.assert_no_request_envelope(log["last_prompt"])
         self.assertEqual(log["last_reply"], FINAL)
         self.assertEqual(log["footer"], self.ch.parse_footer(FINAL))
         self.assertEqual(log["turn"], "done")
@@ -147,6 +169,24 @@ class AntigravityTranscriptAcceptanceTests(AntigravityFixture):
         self.assertEqual(log["tools"], 3, "count calls, not their GENERIC results")
         self.assertEqual(log["last_ts"], "2026-01-01T00:00:09Z")
         self.assertEqual(log["turns_total"], 2)
+
+    def test_user_input_without_request_tag_falls_back_to_raw_content(self):
+        for raw in ("Unwrapped synthetic request.\nKeep Unicode: 测试.",
+                    "<SYNTHETIC_NOTE>\nUnwrapped tagged input.\n</SYNTHETIC_NOTE>"):
+            with self.subTest(raw=raw):
+                self.write_conversation(CONVERSATION, [step(0, "USER_INPUT", raw), reply(1, FINAL)])
+                log = self.log()
+                self.assertEqual(log["goal"], raw)
+                self.assertEqual(log["last_prompt"], raw)
+                self.assertEqual(self.ch.recent_turns(self.rec, 1)[0]["prompt"], raw)
+                self.assertIn(" ".join(raw.split()), self.show_history())
+
+    def test_annotation_title_accepts_compact_and_spaced_colon(self):
+        annotation = self.base / "annotations" / (CONVERSATION + ".pbtxt")
+        for separator in (":", ": "):
+            with self.subTest(separator=separator):
+                annotation.write_text('title' + separator + '"Fix Bug in Calc.py"\n', encoding="utf-8")
+                self.assertEqual(self.log()["title"], "Fix Bug in Calc.py")
 
     def test_workspace_mapping_wins_over_unrelated_session_id_or_newer_conversation(self):
         other_path = self.home / "worktrees" / "other-task"
@@ -213,23 +253,38 @@ class AntigravityTranscriptAcceptanceTests(AntigravityFixture):
                 self.assertNotIn("Created At:", log["last_reply"])
                 self.assertNotIn("private synthetic reasoning", log["last_reply"])
 
+    def test_tool_call_without_content_key_keeps_turn_open(self):
+        rows = self.rows()
+        self.assertNotIn("content", rows[3])
+        for count in (4, 5):
+            with self.subTest(rows=count):
+                self.write_conversation(CONVERSATION, rows[:count])
+                log = self.log()
+                self.assertEqual(log["turn"], "open")
+                self.assertEqual(log["last_reply"], "")
+                self.assertIsNone(log["footer"])
+                self.assertEqual(log["tools"], 1)
+                self.assertEqual(log["last_ts"], rows[count - 1]["created_at"])
+                turn = self.ch.recent_turns(self.rec, 1)[0]
+                self.assertEqual(turn["state"], "open")
+                self.assertEqual(turn["replies"], [])
+                self.assertEqual(turn["tools"], 1)
+
     def test_recent_turns_and_show_use_agy_history(self):
         turns = self.ch.recent_turns(self.rec, 2)
         self.assertEqual(len(turns), 2)
         self.assertEqual(turns[0]["prompt"], "Fix the synthetic parser.")
+        self.assertEqual(turns[-1]["prompt"], "Now handle empty input.\nKeep Unicode: 测试.")
         self.assertEqual(turns[-1]["replies"][-1], FINAL)
         self.assertEqual(turns[-1]["state"], "done")
         self.assertEqual(turns[-1]["tools"], 3)
         self.assertEqual(self.ch.recent_turns(self.rec, 1), turns[-1:])
         self.assertEqual(self.ch.recent_turns(self.rec, 0), [])
-        with mock.patch.object(self.ch, "aoe_records", return_value={self.rec["id"]: self.rec}), \
-                mock.patch.object(self.ch, "scope_info", return_value=None), \
-                mock.patch.object(self.ch, "git_info", return_value=None), \
-                mock.patch.object(self.ch, "screen", return_value=READY):
-            shown = self.ch.show(self.cfg, self.rec["id"], 2)
+        shown = self.show_history()
         self.assertIn("Fix the synthetic parser.", shown)
+        self.assertIn("Now handle empty input. Keep Unicode: 测试.", shown)
         self.assertIn(FINAL, shown)
-        self.assertNotIn("<USER_REQUEST>", shown)
+        self.assert_no_request_envelope(shown)
 
     def test_transcript_redacts_synthetic_secrets(self):
         secret = "sk-" + "z" * 40
