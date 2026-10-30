@@ -135,7 +135,7 @@ Loop rules:
   same pass as the brief without checks, every 15 seconds, and sends in a background thread. Automation stays in
   `watch`, so closing the inbox never stops a task.
 - `?` opens a question input. An owned worker calls `pick_model` and `generate_ai(read_files=False)` with
-  explicit README/architecture documentation, a board snapshot including draft tasks, pending decisions,
+  explicit README and all `docs/*.md` documentation, a board snapshot including draft tasks, pending decisions,
   recent events and review cards. All evidence and recent conversation are redacted and encoded in a single
   untrusted JSON boundary; source delimiters are escaped. The worker emits answer data or a localized error,
   never command, editor, acceptance, decision or reply requests. Navigation and scrolling remain on the UI thread.

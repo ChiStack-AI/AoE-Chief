@@ -479,9 +479,13 @@ def render(ch, st, w, h):
 def question_request(ch, cfg, question, result, history, lang):
     """Build explicit, redacted evidence off the terminal thread. No collect/tick/actions."""
     docs = {}
-    for name in ("README.md", "docs/architecture.md"):
+    root = Path(ch.__file__).resolve().parent
+    # Keep the original fallback for a missing architecture file as well as README.
+    names = {"docs/architecture.md"}
+    names.update(path.relative_to(root).as_posix() for path in (root / "docs").glob("*.md"))
+    for name in ["README.md"] + sorted(names):
         try:
-            docs[name] = (Path(ch.__file__).resolve().parent / name).read_text(encoding="utf-8")
+            docs[name] = (root / name).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             docs[name] = "Documentation unavailable: " + name
     tasks = ch.all_tasks()

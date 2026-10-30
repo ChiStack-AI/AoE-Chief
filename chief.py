@@ -3,7 +3,7 @@
 
 Observes AoE terminal sessions (AoE state, the agents' native transcripts, the live screen, git), triages them with
 deterministic rules, and drives delegated tasks: executable checks, a decision queue, auto-continue, stuck
-detection, session rotation and cross-model review. Python 3.7+, standard library only. See README.md.
+detection, session rotation and cross-model review. Python 3.7+, standard library only. See README.md and docs/.
 """
 import argparse
 import builtins
