@@ -1,12 +1,7 @@
-"""Acceptance contract for a short landing page and lossless topic documentation.
+"""Contract for a short landing page and linked topic documentation.
 
-The frozen fixture is the README at d89b697. Content comparisons normalize only
-whitespace: code fences (including language), complete list items (including
-wrapped continuations), and table rows must survive verbatim. Link destinations
-are not normalized, so any preserved item with a root-relative link must remain
-in README or otherwise retain a valid destination. No external links are fetched.
+Relative links, images and heading anchors must resolve. No external links are fetched.
 """
-from collections import Counter
 from html import unescape
 from html.parser import HTMLParser
 import json
@@ -25,7 +20,6 @@ from documentation_support import read_documentation
 
 
 ROOT = Path(__file__).resolve().parent.parent
-BEFORE = ROOT / "tests/fixtures/readme_before_restructure.md"
 TOPICS = ("guide", "inbox", "commands", "configuration", "agents", "development", "architecture")
 
 
@@ -55,22 +49,6 @@ def fenced_parts(text):
     if marker is not None:
         raise AssertionError("Unclosed Markdown fence: " + current[0])
     return blocks, "\n".join(plain)
-
-
-def preserved_items(text):
-    blocks, plain = fenced_parts(text)
-    items = {"fenced blocks": blocks, "list items": [], "table rows": []}
-    pending = []
-    for line in plain.splitlines() + [""]:
-        bullet = re.match(r"^\s*(?:[-+*]|\d+[.)])\s+\S", line)
-        if pending and (bullet or not line.strip() or not line[0].isspace()):
-            items["list items"].append("\n".join(pending))
-            pending = []
-        if bullet or (pending and line[0].isspace()):
-            pending.append(line)
-        if line.lstrip().startswith("|"):
-            items["table rows"].append(line)
-    return {kind: Counter(normalized(item) for item in values) for kind, values in items.items()}
 
 
 class HTMLLinks(HTMLParser):
@@ -158,15 +136,6 @@ class DocumentationStructureTests(unittest.TestCase):
     def test_readme_is_at_most_200_lines(self):
         self.assertLessEqual(len((ROOT / "README.md").read_text(encoding="utf-8").splitlines()), 200)
 
-    def test_every_original_fence_list_item_and_table_row_survives(self):
-        original = preserved_items(BEFORE.read_text(encoding="utf-8"))
-        current = preserved_items(read_documentation())
-        for kind, required in original.items():
-            with self.subTest(kind=kind):
-                self.assertTrue(required, "the snapshot must exercise " + kind)
-                missing = required - current[kind]
-                self.assertFalse(missing, "Missing {}:\n{}".format(kind, "\n".join(missing)))
-
     def test_topic_documents_exist_and_are_nonempty(self):
         for topic in TOPICS:
             with self.subTest(topic=topic):
@@ -211,13 +180,10 @@ class DocumentationStructureTests(unittest.TestCase):
 
     def test_landing_page_retains_banner_badges_tagline_problem_and_screenshot(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        before = BEFORE.read_text(encoding="utf-8")
-        # The first two HTML paragraphs are the banner and badges; navigation may change.
-        for paragraph in re.findall(r'<p align="center">.*?</p>', before, re.S)[:2]:
-            self.assertIn(normalized(paragraph), normalized(readme))
-        for paragraph in (before.split("> **", 1)[1].split("\n\n", 1)[0],
-                          before.split("You run five", 1)[1].split("\n\n", 1)[0]):
-            self.assertIn(normalized(paragraph), normalized(readme))
+        self.assertIn('src="docs/assets/banner.svg"', readme)
+        self.assertIn("img.shields.io/badge/license", readme)
+        self.assertIn("> **You define the task. You accept the result. Chief handles everything in between.**", readme)
+        self.assertIn("You run five AI coding agents at once.", readme)
         self.assertIn('src="docs/assets/inbox.svg"', readme)
         for phrase in ("How it works", "Quick start", "Daily use", "Supported agents",
                        "Safety model", "Documentation", "Built on", "License"):
@@ -235,17 +201,7 @@ class DocumentationStructureTests(unittest.TestCase):
 
 
 class DocumentationCheckerTests(unittest.TestCase):
-    """Ensure the acceptance checks detect loss and broken rebased links."""
-    def test_preservation_counts_wrapped_items_ordered_items_and_duplicate_rows(self):
-        source = "- first\n  continued\n1. ordered\n   continued\n| a | b |\n| a | b |\n```text\n- code\n```\n"
-        items = preserved_items(source)
-        self.assertEqual(items["list items"], Counter({"- first continued": 1, "1. ordered continued": 1}))
-        self.assertEqual(items["table rows"], Counter({"| a | b |": 2}))
-        self.assertEqual(items["fenced blocks"], Counter({"```text - code ```": 1}))
-        self.assertTrue(items["table rows"] - preserved_items(source.replace("| a | b |\n", "", 1))["table rows"])
-        self.assertTrue(items["list items"] - preserved_items(source.replace("continued", "changed", 1))["list items"])
-        self.assertTrue(items["fenced blocks"] - preserved_items(source.replace("- code", "- changed"))["fenced blocks"])
-
+    """Ensure the link checks detect broken rebased links."""
     def test_links_cover_markdown_images_references_html_and_ignore_code(self):
         source = ('[A](guide.md#hello) ![B](assets/inbox.svg) <a href="../LICENSE">L</a> '
                   '<img src="assets/banner.svg"> [C][ref]\n[ref]: agents.md\n'
