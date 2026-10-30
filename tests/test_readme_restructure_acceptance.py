@@ -97,6 +97,7 @@ def destinations(text):
     references = {}
     for match in re.finditer(r'^\s{0,3}\[([^\]]+)\]:\s*' + target + r'\s*$', plain, re.M):
         references[normalized(match.group(1)).lower()] = match.group(2) or match.group(3)
+    plain = re.sub(r"^\s{0,3}\[[^\]]+\]:[^\n]*$", "", plain, flags=re.M)
     for match in re.finditer(r'!?\[([^\]\n]+)\](?:\[([^\]\n]*)\])?(?!\()', plain):
         label = normalized(match.group(2) or match.group(1)).lower()
         if label in references:
