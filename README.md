@@ -629,6 +629,20 @@ exec claude "$@"
 Resume a conversation through the same wrapper that created it. A conversation that went through a proxy may contain
 content the plain endpoint rejects.
 
+`commands` applies only to sessions Chief starts. A session you open directly in AoE (its TUI, or `aoe add` without
+`--cmd-override`) starts with AoE's own command for that tool, so it does not go through the wrapper. Mixing the two
+is safe:
+
+- each session keeps the command it was started with, including across restarts and resumes;
+- Chief can track a session opened directly in AoE, because it reads the transcript, which does not depend on how
+  the agent was launched;
+- if Chief rotates such a session, the successor starts through Chief's command. Work carries over through the
+  progress file as usual; only the endpoint changes (with a model router, for example, routed models become
+  available).
+
+To route sessions opened directly in AoE as well, configure the command in AoE itself (its
+`session.agent_command_override` setting; see AoE's documentation). Chief's `commands` can then stay or be removed.
+
 </details>
 
 <details>
