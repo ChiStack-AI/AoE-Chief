@@ -75,7 +75,7 @@ See the [task guide](docs/guide.md) for the workflow and [architecture](docs/arc
   Antigravity work uses Codex by default, or Claude when configured with `review_engine`.
 
 ```bash
-git clone https://github.com/ChiStack-AI/AoE-Chief.git ~/aoe-chief
+git clone https://github.com/augentic-lab/AoE-Chief.git ~/aoe-chief
 alias chief="python3 ~/aoe-chief/chief.py"
 chief init
 
