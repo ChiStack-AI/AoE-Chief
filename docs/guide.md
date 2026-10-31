@@ -74,6 +74,23 @@ chief inbox                      # check in whenever you like (or: chief brief)
 For standing AoE sessions, see [Running Chief in AoE](inbox.md#running-chief-in-aoe).
 For worker selection and startup prompts, see [Supported agents](agents.md).
 
+### Handing off from a conversation
+
+Most plans take shape while you talk with an agent. Instead of retyping the plan into `chief new`, tell that agent
+"delegate to chief" (or "交给 chief"). It follows [rules/handoff.md](../rules/handoff.md): it writes a self-contained
+contract (goal with the decisions already made, checks, protected paths, worker tool), runs
+`chief new --from <contract>`, and reports the task id. The conversation stays free for the next topic; the new
+worker starts in its own worktree with the usual test-first approval.
+
+Agents learn this from one line in their global instructions (installed in the [quick start](../README.md#-quick-start)):
+
+```text
+When I ask you to hand work off to AoE Chief, read ~/aoe-chief/rules/handoff.md and follow it.
+The Chief command is: python3 ~/aoe-chief/chief.py
+```
+
+Adjust the paths if Chief lives elsewhere.
+
 ## Decisions and acceptance tests
 
 New tasks begin with a test phase: the worker writes failing acceptance tests, commits them, and asks you to

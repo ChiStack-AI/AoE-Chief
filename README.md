@@ -83,7 +83,14 @@ chief init
 mkdir -p ~/.claude ~/.codex
 cat ~/aoe-chief/rules/communication.md >> ~/.claude/CLAUDE.md
 cat ~/aoe-chief/rules/communication.md >> ~/.codex/AGENTS.md
+
+# Let any conversation hand its plan to Chief ("delegate to chief").
+for f in ~/.claude/CLAUDE.md ~/.codex/AGENTS.md; do printf '\n%s\n' "When I ask you to hand work off to AoE Chief, \
+read ~/aoe-chief/rules/handoff.md and follow it. The Chief command is: python3 ~/aoe-chief/chief.py" >> "$f"; done
 ```
+
+Most work starts in a conversation: once you and the agent agree on a plan, say "delegate to chief" and it writes
+the task contract and starts a supervised worker. See [Handing off from a conversation](docs/guide.md#handing-off-from-a-conversation).
 
 ### 🎮 Try the demo (about 6 minutes)
 
