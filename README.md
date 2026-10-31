@@ -80,12 +80,13 @@ alias chief="python3 ~/aoe-chief/chief.py"
 chief init
 
 # Teach your agents the closing-block protocol. This appends, so existing instructions are kept.
-mkdir -p ~/.claude ~/.codex
+mkdir -p ~/.claude ~/.codex ~/.gemini
 cat ~/aoe-chief/rules/communication.md >> ~/.claude/CLAUDE.md
 cat ~/aoe-chief/rules/communication.md >> ~/.codex/AGENTS.md
+cat ~/aoe-chief/rules/communication.md >> ~/.gemini/GEMINI.md    # Antigravity CLI (agy)
 
 # Let any conversation hand its plan to Chief ("delegate to chief").
-for f in ~/.claude/CLAUDE.md ~/.codex/AGENTS.md; do printf '\n%s\n' "When I ask you to hand work off to AoE Chief, \
+for f in ~/.claude/CLAUDE.md ~/.codex/AGENTS.md ~/.gemini/GEMINI.md; do printf '\n%s\n' "When I ask you to hand work off to AoE Chief, \
 read ~/aoe-chief/rules/handoff.md and follow it. The Chief command is: python3 ~/aoe-chief/chief.py" >> "$f"; done
 ```
 

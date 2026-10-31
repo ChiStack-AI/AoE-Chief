@@ -60,3 +60,7 @@ For agy prompts, only the `USER_REQUEST` body is shown; trailing metadata and se
 Untagged input is kept as raw text. The last planner response supplies the reply and closing block, while tool
 calls and results update activity without masquerading as final replies. The same history feeds show, briefs,
 decisions, auto-continue, recovery, and stuck detection. Missing history falls back to screen-based observation.
+
+agy reads global rules from `~/.gemini/GEMINI.md` (or `~/.gemini/AGENTS.md`). Install the communication rules and
+the hand-off line there, as in the [quick start](../README.md#-quick-start), so conversations with agy end with a
+closing block and can hand work off to Chief.
